@@ -1,0 +1,1327 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "fastapi>=0.110",
+#     "httpx>=0.27",
+#     "uvicorn>=0.29",
+#     "pyyaml>=6.0",
+# ]
+# ///
+"""
+anthropic_proxy — queueing proxy for the Anthropic /v1/messages API.
+
+Two-tier model (coupled):
+  - LOW:  max_concurrent=4,    600 req / 5h
+  - HIGH: max_concurrent=1000, 9999 req / 1h
+
+Web dashboard at  http://<host>:<port>/_proxy/
+Raw metrics JSON  http://<host>:<port>/_proxy/metrics
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+from collections import deque
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+import httpx
+import yaml
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
+
+
+CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "config.yaml")).resolve()
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "upstream_base_url": "https://api.anthropic.com",
+    "listen_host": "127.0.0.1",
+    "listen_port": 8787,
+    "initial_tier": "low",
+    "force_tier": None,
+    "tiers": {
+        "low":  {"max_concurrent": 4,    "window_seconds": 18000, "max_per_window": 600},
+        "high": {"max_concurrent": 1000, "window_seconds": 3600,  "max_per_window": 9999},
+    },
+    "promotion_cooldown_seconds": 300,
+    "retry_max_attempts": 12,
+    "retry_base_delay": 1.0,
+    "retry_max_delay": 60.0,
+    "upstream_timeout": 600,
+    "log_level": "INFO",
+    "config_poll_seconds": 2.0,
+    "metrics_window_seconds": 86400,
+    "model_pricing": {},
+}
+
+RATE_LIMIT_STATUSES = {429, 503, 529}
+HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+    "content-encoding",  # stripped because we forward already-decoded chunks
+}
+METRIC_WINDOWS = [("1m", 60), ("10m", 600), ("1h", 3600), ("5h", 18000), ("24h", 86400)]
+
+logging.basicConfig(
+    level="INFO",
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+log = logging.getLogger("proxy")
+
+
+# ---------- Tier + Limiter ----------
+
+class Tier:
+    __slots__ = ("name", "max_concurrent", "window_seconds", "max_per_window")
+
+    def __init__(self, name: str, max_concurrent: int, window_seconds: float, max_per_window: int):
+        self.name = name
+        self.max_concurrent = max_concurrent
+        self.window_seconds = window_seconds
+        self.max_per_window = max_per_window
+
+
+class Limiter:
+    """Concurrency + rolling-window throttle with auto-tier-detection."""
+
+    def __init__(self, low: Tier, high: Tier, initial_tier: str,
+                 promotion_cooldown: float, forced: str | None):
+        self._cond = asyncio.Condition()
+        self._low = low
+        self._high = high
+        self._active = high if initial_tier == "high" else low
+        self._forced: str | None = forced if forced in ("low", "high") else None
+        if self._forced:
+            self._active = self._low if self._forced == "low" else self._high
+        self._promotion_cooldown = promotion_cooldown
+        self._last_demotion = 0.0
+        self._in_flight = 0
+        self._waiters = 0
+        self._recent_starts: deque[float] = deque()
+        self._probe_in_flight = False
+        self._n_requests = 0
+        self._n_rate_limited = 0
+        self._n_other_errors = 0
+        self._n_concurrency_waits = 0
+        self._n_paced_waits = 0
+        self._n_promotions = 0
+        self._n_demotions = 0
+        self._n_probes_sent = 0
+
+    def _prune_window(self, now: float) -> None:
+        cutoff = now - self._active.window_seconds
+        while self._recent_starts and self._recent_starts[0] < cutoff:
+            self._recent_starts.popleft()
+
+    async def acquire(self) -> bool:
+        async with self._cond:
+            self._waiters += 1
+            try:
+                while True:
+                    now = time.monotonic()
+                    self._prune_window(now)
+
+                    if len(self._recent_starts) >= self._active.max_per_window:
+                        wait = self._recent_starts[0] + self._active.window_seconds - now
+                        self._n_paced_waits += 1
+                        try:
+                            await asyncio.wait_for(self._cond.wait(), timeout=max(0.05, wait))
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
+
+                    if self._in_flight < self._active.max_concurrent:
+                        self._in_flight += 1
+                        self._recent_starts.append(now)
+                        self._n_requests += 1
+                        return False
+
+                    can_probe = (
+                        self._forced is None
+                        and self._active is self._low
+                        and not self._probe_in_flight
+                        and self._waiters > 0
+                        and now - self._last_demotion >= self._promotion_cooldown
+                    )
+                    if can_probe:
+                        self._in_flight += 1
+                        self._recent_starts.append(now)
+                        self._n_requests += 1
+                        self._probe_in_flight = True
+                        self._n_probes_sent += 1
+                        log.info(
+                            f"probing HIGH tier (in_flight={self._in_flight}, "
+                            f"waiters={self._waiters})"
+                        )
+                        return True
+
+                    self._n_concurrency_waits += 1
+                    await self._cond.wait()
+            finally:
+                self._waiters -= 1
+
+    async def release_success(self, was_probe: bool) -> None:
+        async with self._cond:
+            self._in_flight -= 1
+            if was_probe:
+                self._probe_in_flight = False
+                if self._active is self._low and self._forced is None:
+                    self._active = self._high
+                    self._n_promotions += 1
+                    log.warning(
+                        f"tier promoted LOW -> HIGH (cap conc={self._high.max_concurrent}, "
+                        f"{self._high.max_per_window}/{int(self._high.window_seconds)}s)"
+                    )
+            self._cond.notify_all()
+
+    async def release_rate_limited(self, was_probe: bool) -> None:
+        async with self._cond:
+            self._in_flight -= 1
+            self._n_rate_limited += 1
+            now = time.monotonic()
+            if was_probe:
+                self._probe_in_flight = False
+                self._last_demotion = now
+                if self._active is self._low:
+                    log.info("probe failed; staying LOW, cooldown reset")
+            if self._active is self._high and self._forced is None:
+                self._active = self._low
+                self._n_demotions += 1
+                self._last_demotion = now
+                log.warning(
+                    f"tier demoted HIGH -> LOW (cap conc={self._low.max_concurrent}, "
+                    f"{self._low.max_per_window}/{int(self._low.window_seconds)}s)"
+                )
+            self._cond.notify_all()
+
+    async def release_other_error(self, was_probe: bool) -> None:
+        async with self._cond:
+            self._in_flight -= 1
+            self._n_other_errors += 1
+            if was_probe:
+                self._probe_in_flight = False
+            self._cond.notify_all()
+
+    async def boost_high(self) -> bool:
+        """Temporarily jump to HIGH without pinning it.
+
+        Unlike force_tier="high", auto-demotion stays enabled: the first
+        rate-limited response (429/503/529) drops back to LOW. Refused while a
+        force_tier is set, since that pins the tier explicitly.
+        """
+        async with self._cond:
+            if self._forced is not None:
+                return False
+            if self._active is not self._high:
+                self._active = self._high
+                self._n_promotions += 1
+                log.warning(
+                    "tier boosted LOW -> HIGH (temporary; auto-demotes on "
+                    f"rate-limit; cap conc={self._high.max_concurrent}, "
+                    f"{self._high.max_per_window}/{int(self._high.window_seconds)}s)"
+                )
+            self._cond.notify_all()
+            return True
+
+    async def update_tiers(self, low: Tier, high: Tier,
+                           promotion_cooldown: float, forced: str | None) -> None:
+        async with self._cond:
+            self._low = low
+            self._high = high
+            self._promotion_cooldown = promotion_cooldown
+            self._forced = forced if forced in ("low", "high") else None
+            if self._forced == "low":
+                self._active = self._low
+            elif self._forced == "high":
+                self._active = self._high
+            else:
+                self._active = self._low if self._active.name == "low" else self._high
+            self._cond.notify_all()
+
+    def snapshot(self) -> dict[str, Any]:
+        now = time.monotonic()
+        self._prune_window(now)
+        next_window_slot_in = None
+        if (
+            self._recent_starts
+            and len(self._recent_starts) >= self._active.max_per_window
+        ):
+            next_window_slot_in = max(
+                0.0, self._recent_starts[0] + self._active.window_seconds - now
+            )
+        return {
+            "active_tier": self._active.name,
+            "forced_tier": self._forced,
+            "max_concurrent": self._active.max_concurrent,
+            "max_per_window": self._active.max_per_window,
+            "window_seconds": self._active.window_seconds,
+            "in_flight": self._in_flight,
+            "queued": self._waiters,
+            "window_used": len(self._recent_starts),
+            "next_window_slot_in_seconds": next_window_slot_in,
+            "probe_in_flight": self._probe_in_flight,
+            "totals": {
+                "requests": self._n_requests,
+                "rate_limited": self._n_rate_limited,
+                "other_errors": self._n_other_errors,
+                "concurrency_waits": self._n_concurrency_waits,
+                "paced_waits": self._n_paced_waits,
+                "promotions": self._n_promotions,
+                "demotions": self._n_demotions,
+                "probes_sent": self._n_probes_sent,
+            },
+        }
+
+
+# ---------- Metrics ----------
+
+class SSEUsageExtractor:
+    """Watches an SSE byte stream for /v1/messages usage info.
+
+    Anthropic emits a `message_start` event whose data contains
+    `message.usage` (input_tokens, cache_*), and a `message_delta` event whose
+    data contains `usage.output_tokens`. We accumulate the latest values and
+    return them once the stream ends.
+    """
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self._input = 0
+        self._output = 0
+        self._cache_creation = 0
+        self._cache_read = 0
+        self._got_any = False
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self._buf.extend(chunk)
+        while True:
+            sep = self._buf.find(b"\n\n")
+            if sep < 0:
+                if len(self._buf) > 65536:
+                    # Drop everything but the last 64KB to bound memory.
+                    del self._buf[: len(self._buf) - 65536]
+                return
+            event = bytes(self._buf[:sep])
+            del self._buf[: sep + 2]
+            self._parse_event(event)
+
+    def _parse_event(self, block: bytes) -> None:
+        data_parts: list[bytes] = []
+        for line in block.split(b"\n"):
+            if line.startswith(b"data:"):
+                data_parts.append(line[5:].lstrip())
+        if not data_parts:
+            return
+        try:
+            obj = json.loads(b"\n".join(data_parts))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if not isinstance(obj, dict):
+            return
+        et = obj.get("type")
+        if et == "message_start":
+            usage = (obj.get("message") or {}).get("usage") or {}
+            self._merge(usage)
+        elif et == "message_delta":
+            self._merge(obj.get("usage") or {})
+
+    def _merge(self, usage: dict) -> None:
+        self._got_any = True
+        if "input_tokens" in usage:
+            self._input = max(self._input, int(usage.get("input_tokens") or 0))
+        if "output_tokens" in usage:
+            self._output = max(self._output, int(usage.get("output_tokens") or 0))
+        if "cache_creation_input_tokens" in usage:
+            self._cache_creation = max(
+                self._cache_creation, int(usage.get("cache_creation_input_tokens") or 0)
+            )
+        if "cache_read_input_tokens" in usage:
+            self._cache_read = max(
+                self._cache_read, int(usage.get("cache_read_input_tokens") or 0)
+            )
+
+    def final_usage(self) -> dict | None:
+        if not self._got_any:
+            return None
+        return {
+            "input_tokens": self._input,
+            "output_tokens": self._output,
+            "cache_creation_input_tokens": self._cache_creation,
+            "cache_read_input_tokens": self._cache_read,
+        }
+
+
+class JSONUsageExtractor:
+    """Buffers a non-streaming JSON response body and extracts top-level usage."""
+
+    def __init__(self, max_bytes: int = 8 * 1024 * 1024) -> None:
+        self._buf = bytearray()
+        self._max = max_bytes
+        self._oversize = False
+
+    def feed(self, chunk: bytes) -> None:
+        if self._oversize or not chunk:
+            return
+        if len(self._buf) + len(chunk) > self._max:
+            self._oversize = True
+            self._buf.clear()
+            return
+        self._buf.extend(chunk)
+
+    def final_usage(self) -> dict | None:
+        if self._oversize or not self._buf:
+            return None
+        try:
+            obj = json.loads(bytes(self._buf))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(obj, dict):
+            return None
+        usage = obj.get("usage")
+        if not isinstance(usage, dict):
+            return None
+        return {
+            "input_tokens": int(usage.get("input_tokens", 0) or 0),
+            "output_tokens": int(usage.get("output_tokens", 0) or 0),
+            "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens", 0) or 0),
+            "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
+        }
+
+
+def make_extractor(content_type: str):
+    if "text/event-stream" in content_type.lower():
+        return SSEUsageExtractor()
+    return JSONUsageExtractor()
+
+
+def extract_model(method: str, body: bytes) -> str:
+    """Extract `model` from a JSON request body. Falls back to '(unknown)'."""
+    if method == "GET" or not body:
+        return "(no-body)"
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        return "(unknown)"
+    if isinstance(data, dict):
+        m = data.get("model")
+        if isinstance(m, str) and m:
+            return m
+    return "(unknown)"
+
+
+def _stats(durations: list[float]) -> dict[str, float | None]:
+    n = len(durations)
+    if n == 0:
+        return {"avg_seconds": None, "p50_seconds": None, "p95_seconds": None}
+    s = sorted(durations)
+    return {
+        "avg_seconds": sum(s) / n,
+        "p50_seconds": s[n // 2],
+        "p95_seconds": s[min(n - 1, int(n * 0.95))],
+    }
+
+
+_TOK_KEYS = ("input_tokens", "output_tokens",
+             "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def _empty_window_bucket() -> dict[str, Any]:
+    return {
+        "durations": [],
+        "success": 0,
+        "errors": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cost": 0.0,
+        "priced_requests": 0,
+    }
+
+
+class Metrics:
+    """Per-request timing + token tracker; 24h rolling window of completions."""
+
+    def __init__(self, max_window_seconds: float = 86400,
+                 pricing: dict[str, dict[str, float]] | None = None):
+        # (end, dur, model, status, in_tok, out_tok, cc_tok, cr_tok)
+        self._completions: deque[
+            tuple[float, float, str, int, int, int, int, int]
+        ] = deque()
+        self._active_per_model: dict[str, int] = {}
+        self._max_age = max_window_seconds
+        self._pricing: dict[str, dict[str, float]] = pricing or {}
+
+    def set_pricing(self, pricing: dict[str, dict[str, float]] | None) -> None:
+        self._pricing = pricing or {}
+
+    def request_started(self, model: str) -> float:
+        self._active_per_model[model] = self._active_per_model.get(model, 0) + 1
+        return time.time()
+
+    def request_finished(self, model: str, started_at: float, status: int,
+                         usage: dict | None = None) -> None:
+        now = time.time()
+        c = self._active_per_model.get(model, 0) - 1
+        if c <= 0:
+            self._active_per_model.pop(model, None)
+        else:
+            self._active_per_model[model] = c
+        u = usage or {}
+        self._completions.append((
+            now,
+            now - started_at,
+            model,
+            status,
+            int(u.get("input_tokens", 0) or 0),
+            int(u.get("output_tokens", 0) or 0),
+            int(u.get("cache_creation_input_tokens", 0) or 0),
+            int(u.get("cache_read_input_tokens", 0) or 0),
+        ))
+        cutoff = now - self._max_age
+        while self._completions and self._completions[0][0] < cutoff:
+            self._completions.popleft()
+
+    def set_max_age(self, seconds: float) -> None:
+        self._max_age = seconds
+
+    def _cost(self, model: str, in_t: int, out_t: int, cc_t: int, cr_t: int) -> float | None:
+        p = self._pricing.get(model)
+        if not p:
+            return None
+        in_p  = float(p.get("input", 0) or 0)
+        out_p = float(p.get("output", 0) or 0)
+        cc_p  = float(p.get("cache_creation", in_p))
+        cr_p  = float(p.get("cache_read", in_p))
+        return (in_t * in_p + out_t * out_p + cc_t * cc_p + cr_t * cr_p) / 1_000_000
+
+    def summary(self) -> dict[str, Any]:
+        now = time.time()
+        cutoff = now - self._max_age
+        while self._completions and self._completions[0][0] < cutoff:
+            self._completions.popleft()
+
+        overall = {label: _empty_window_bucket() for label, _ in METRIC_WINDOWS}
+        per_model_buckets: dict[str, dict[str, dict[str, Any]]] = {}
+
+        for end, dur, model, status, in_t, out_t, cc_t, cr_t in self._completions:
+            age = now - end
+            is_success = 200 <= status < 400
+            cost = self._cost(model, in_t, out_t, cc_t, cr_t)
+            mb = per_model_buckets.get(model)
+            if mb is None:
+                mb = {label: _empty_window_bucket() for label, _ in METRIC_WINDOWS}
+                per_model_buckets[model] = mb
+            for label, w in METRIC_WINDOWS:
+                if age > w:
+                    continue
+                for bucket in (overall[label], mb[label]):
+                    bucket["durations"].append(dur)
+                    if is_success:
+                        bucket["success"] += 1
+                    else:
+                        bucket["errors"] += 1
+                    bucket["input_tokens"] += in_t
+                    bucket["output_tokens"] += out_t
+                    bucket["cache_creation_input_tokens"] += cc_t
+                    bucket["cache_read_input_tokens"] += cr_t
+                    if cost is not None:
+                        bucket["cost"] += cost
+                        bucket["priced_requests"] += 1
+
+        def finalize(bucket_set: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+            out: dict[str, dict[str, Any]] = {}
+            for label, b in bucket_set.items():
+                st = _stats(b["durations"])
+                out[label] = {
+                    "count": b["success"] + b["errors"],
+                    "success": b["success"],
+                    "errors": b["errors"],
+                    **st,
+                    "input_tokens": b["input_tokens"],
+                    "output_tokens": b["output_tokens"],
+                    "cache_creation_input_tokens": b["cache_creation_input_tokens"],
+                    "cache_read_input_tokens": b["cache_read_input_tokens"],
+                    "cost": b["cost"] if b["priced_requests"] > 0 else None,
+                    "priced_requests": b["priced_requests"],
+                }
+            return out
+
+        per_model_out: dict[str, dict[str, Any]] = {}
+        for model, buckets in per_model_buckets.items():
+            per_model_out[model] = finalize(buckets)
+
+        for model in self._active_per_model:
+            per_model_out.setdefault(model, finalize(
+                {label: _empty_window_bucket() for label, _ in METRIC_WINDOWS}
+            ))
+
+        for model in per_model_out:
+            per_model_out[model]["active"] = self._active_per_model.get(model, 0)
+            per_model_out[model]["has_pricing"] = model in self._pricing
+
+        return {
+            "overall": finalize(overall),
+            "per_model": per_model_out,
+            "total_active": sum(self._active_per_model.values()),
+            "pricing_configured_models": sorted(self._pricing.keys()),
+        }
+
+
+# ---------- Config loading & hot-reload ----------
+
+config: dict[str, Any] = {}
+config_mtime: float = 0.0
+limiter: Limiter | None = None
+metrics: Metrics | None = None
+client: httpx.AsyncClient | None = None
+
+
+def load_config_file() -> dict[str, Any]:
+    merged: dict[str, Any] = {**DEFAULT_CONFIG, "tiers": dict(DEFAULT_CONFIG["tiers"])}
+    if not CONFIG_PATH.exists():
+        log.warning(f"config file {CONFIG_PATH} not found; using defaults")
+        return merged
+    with open(CONFIG_PATH) as f:
+        loaded = yaml.safe_load(f) or {}
+    for k, v in loaded.items():
+        if k == "tiers" and isinstance(v, dict):
+            merged["tiers"] = {**merged["tiers"], **v}
+        else:
+            merged[k] = v
+    return merged
+
+
+def make_tier(cfg: dict[str, Any], name: str) -> Tier:
+    t = cfg["tiers"][name]
+    return Tier(
+        name=name,
+        max_concurrent=int(t["max_concurrent"]),
+        window_seconds=float(t["window_seconds"]),
+        max_per_window=int(t["max_per_window"]),
+    )
+
+
+def init_from_config(cfg: dict[str, Any]) -> tuple[Limiter, Metrics]:
+    forced = cfg.get("force_tier") if cfg.get("force_tier") in ("low", "high") else None
+    lim = Limiter(
+        low=make_tier(cfg, "low"),
+        high=make_tier(cfg, "high"),
+        initial_tier=cfg.get("initial_tier", "low"),
+        promotion_cooldown=float(cfg["promotion_cooldown_seconds"]),
+        forced=forced,
+    )
+    pricing = cfg.get("model_pricing") or {}
+    if not isinstance(pricing, dict):
+        pricing = {}
+    met = Metrics(
+        max_window_seconds=float(cfg["metrics_window_seconds"]),
+        pricing=pricing,
+    )
+    return lim, met
+
+
+async def apply_config_change(new_cfg: dict[str, Any]) -> None:
+    global config
+    if new_cfg.get("upstream_base_url") != config.get("upstream_base_url"):
+        log.warning("config: upstream_base_url changed -> restart required")
+    log_level = str(new_cfg.get("log_level", "INFO")).upper()
+    logging.getLogger().setLevel(log_level)
+    forced = new_cfg.get("force_tier") if new_cfg.get("force_tier") in ("low", "high") else None
+    await limiter.update_tiers(
+        low=make_tier(new_cfg, "low"),
+        high=make_tier(new_cfg, "high"),
+        promotion_cooldown=float(new_cfg["promotion_cooldown_seconds"]),
+        forced=forced,
+    )
+    metrics.set_max_age(float(new_cfg["metrics_window_seconds"]))
+    new_pricing = new_cfg.get("model_pricing") or {}
+    metrics.set_pricing(new_pricing if isinstance(new_pricing, dict) else {})
+    config = new_cfg
+    log.info(f"config reloaded from {CONFIG_PATH} (force_tier={forced})")
+
+
+async def config_watch_loop() -> None:
+    global config_mtime
+    while True:
+        try:
+            if CONFIG_PATH.exists():
+                mt = CONFIG_PATH.stat().st_mtime
+                if mt != config_mtime:
+                    new_cfg = load_config_file()
+                    await apply_config_change(new_cfg)
+                    config_mtime = mt
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"config reload failed: {e!r}")
+        await asyncio.sleep(float(config.get("config_poll_seconds", 2.0)))
+
+
+# Bootstrap
+config = load_config_file()
+try:
+    config_mtime = CONFIG_PATH.stat().st_mtime
+except FileNotFoundError:
+    config_mtime = 0.0
+logging.getLogger().setLevel(str(config.get("log_level", "INFO")).upper())
+limiter, metrics = init_from_config(config)
+
+
+# ---------- HTTP app ----------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global client
+    client = httpx.AsyncClient(
+        base_url=str(config["upstream_base_url"]).rstrip("/"),
+        timeout=httpx.Timeout(float(config["upstream_timeout"]), connect=15.0),
+        limits=httpx.Limits(max_connections=None, max_keepalive_connections=100),
+    )
+    watcher = asyncio.create_task(config_watch_loop())
+    log.info(
+        f"anthropic_proxy on http://{config['listen_host']}:{config['listen_port']} "
+        f"-> {config['upstream_base_url']} | tier={limiter._active.name} "
+        f"forced={limiter._forced} | dashboard: /_proxy/"
+    )
+    try:
+        yield
+    finally:
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        await client.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def compute_backoff(attempt: int, retry_after: float | None) -> float:
+    if retry_after is not None and retry_after > 0:
+        return min(retry_after, float(config["retry_max_delay"]))
+    delay = float(config["retry_base_delay"]) * (2 ** (attempt - 1))
+    return min(delay, float(config["retry_max_delay"]))
+
+
+# ---------- Dashboard ----------
+
+DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>anthropic_proxy</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+    margin: 0; padding: 20px; font-size: 14px;
+  }
+  .container { max-width: 1100px; margin: 0 auto; }
+  h1 { margin: 0 0 4px 0; font-size: 20px; font-weight: 600; }
+  .header {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 20px;
+  }
+  .header .sub { color: var(--muted); font-size: 12px; }
+  #live { font-size: 12px; color: var(--green); font-variant-numeric: tabular-nums; }
+  #live.error { color: var(--red); }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; margin-bottom: 16px;
+  }
+  .panel h2 {
+    margin: 0 0 12px 0; font-size: 11px; font-weight: 600;
+    color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px;
+  }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+  }
+  .stat {
+    background: rgba(0,0,0,0.25); padding: 12px; border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.03);
+  }
+  .stat .label {
+    color: var(--muted); font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.7px; margin-bottom: 6px;
+  }
+  .stat .value {
+    font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums;
+  }
+  .stat .value.tier-low { color: var(--yellow); }
+  .stat .value.tier-high { color: var(--green); }
+  .stat .value.warn { color: var(--yellow); }
+  .stat .value.crit { color: var(--red); }
+  .stat .sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  table {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  th:first-child, td:first-child { text-align: left; }
+  th {
+    color: var(--muted); font-weight: 600; text-transform: uppercase;
+    font-size: 10px; letter-spacing: 0.7px;
+  }
+  .model-card {
+    margin-bottom: 12px; padding: 12px;
+    background: rgba(0,0,0,0.25); border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.03);
+  }
+  .model-card:last-child { margin-bottom: 0; }
+  .model-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 8px;
+  }
+  .model-name {
+    font-weight: 600; color: var(--accent);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px;
+  }
+  .model-active { color: var(--muted); font-size: 11px; }
+  .model-active strong { color: var(--text); }
+  .footer { color: var(--muted); font-size: 11px; margin-top: 20px; text-align: center; }
+  .footer a { color: var(--muted); }
+  .empty { color: var(--muted); font-style: italic; text-align: center; padding: 12px; }
+  .err { color: var(--red); }
+  .ok { color: var(--green); }
+  #boost-btn {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+  }
+  #boost-btn:hover:not(:disabled) { border-color: var(--green); color: var(--green); }
+  #boost-btn:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div>
+      <h1>anthropic_proxy</h1>
+      <div class="sub" id="upstream"></div>
+    </div>
+    <div style="display:flex; align-items:baseline; gap:12px;">
+      <button id="boost-btn" title="Temporarily switch to HIGH; auto-demotes to LOW on the first rate-limit">⚡ Boost HIGH</button>
+      <div id="live">connecting…</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Current State</h2>
+    <div id="state-grid" class="grid"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Throughput · requests processed</h2>
+    <div id="throughput-grid" class="grid"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Overall Latency</h2>
+    <table id="overall-table"></table>
+  </div>
+
+  <div class="panel">
+    <h2>Overall Tokens &amp; Cost</h2>
+    <table id="overall-tokens-table"></table>
+  </div>
+
+  <div class="panel">
+    <h2>Per Model</h2>
+    <div id="per-model"></div>
+  </div>
+
+  <div class="footer">
+    refreshes every 2 seconds ·
+    <a href="/_proxy/metrics">metrics json</a> ·
+    <a href="/_proxy/config">config json</a> ·
+    <a href="/_proxy/status">limiter status</a>
+  </div>
+</div>
+<script>
+const WINDOWS = ["1m", "10m", "1h", "5h", "24h"];
+function fmtDur(s) {
+  if (s === null || s === undefined) return "—";
+  if (s < 1)   return (s * 1000).toFixed(0) + "ms";
+  if (s < 60)  return s.toFixed(2) + "s";
+  if (s < 3600) return (s / 60).toFixed(1) + "m";
+  return (s / 3600).toFixed(2) + "h";
+}
+function fmtCountdown(s) {
+  if (s === null || s === undefined) return "—";
+  if (s < 60)  return s.toFixed(0) + "s";
+  if (s < 3600) return (s / 60).toFixed(1) + "m";
+  return (s / 3600).toFixed(2) + "h";
+}
+function fmtNum(n) {
+  if (n === null || n === undefined) return "—";
+  if (n === 0) return "0";
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (abs >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (abs >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return n.toString();
+}
+function fmtCost(c) {
+  if (c === null || c === undefined) return "—";
+  if (c === 0) return "$0.00";
+  if (c < 0.01) return "<$0.01";
+  if (c < 1) return "$" + c.toFixed(3);
+  if (c < 100) return "$" + c.toFixed(2);
+  return "$" + c.toFixed(0);
+}
+function row(stats) {
+  const errClass = stats.errors > 0 ? "err" : "";
+  return `
+    <td>${stats.count}</td>
+    <td class="ok">${stats.success ?? 0}</td>
+    <td class="${errClass}">${stats.errors ?? 0}</td>
+    <td>${fmtDur(stats.avg_seconds)}</td>
+    <td>${fmtDur(stats.p50_seconds)}</td>
+    <td>${fmtDur(stats.p95_seconds)}</td>
+  `;
+}
+function tokenRow(stats) {
+  return `
+    <td>${fmtNum(stats.input_tokens)}</td>
+    <td>${fmtNum(stats.output_tokens)}</td>
+    <td>${fmtNum(stats.cache_creation_input_tokens)}</td>
+    <td>${fmtNum(stats.cache_read_input_tokens)}</td>
+    <td>${fmtCost(stats.cost)}</td>
+  `;
+}
+function renderWindowTable(data) {
+  let html = "<tr><th>Window</th><th>Count</th><th>OK</th><th>Err</th><th>Avg</th><th>p50</th><th>p95</th></tr>";
+  for (const w of WINDOWS) {
+    const s = data[w] || {count:0, success:0, errors:0, avg_seconds:null, p50_seconds:null, p95_seconds:null};
+    html += `<tr><td>${w}</td>${row(s)}</tr>`;
+  }
+  return html;
+}
+function renderTokenTable(data) {
+  let html = "<tr><th>Window</th><th>Input</th><th>Output</th><th>Cache Write</th><th>Cache Read</th><th>Cost</th></tr>";
+  for (const w of WINDOWS) {
+    const s = data[w] || {input_tokens:0, output_tokens:0, cache_creation_input_tokens:0, cache_read_input_tokens:0, cost:null};
+    html += `<tr><td>${w}</td>${tokenRow(s)}</tr>`;
+  }
+  return html;
+}
+function pct(used, max) {
+  if (!max) return 0;
+  return Math.min(100, (used / max) * 100);
+}
+async function tick() {
+  try {
+    const r = await fetch("/_proxy/metrics");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const m = await r.json();
+    const liveEl = document.getElementById("live");
+    liveEl.textContent = "● live · " + new Date().toLocaleTimeString();
+    liveEl.classList.remove("error");
+
+    document.getElementById("upstream").textContent = "→ " + (m.upstream || "");
+
+    const L = m.limiter;
+    const boostBtn = document.getElementById("boost-btn");
+    if (L.forced_tier) {
+      boostBtn.disabled = true;
+      boostBtn.textContent = "forced: " + L.forced_tier;
+    } else if (L.active_tier === "high") {
+      boostBtn.disabled = true;
+      boostBtn.textContent = "⚡ on HIGH";
+    } else {
+      boostBtn.disabled = false;
+      boostBtn.textContent = "⚡ Boost HIGH";
+    }
+    const tierClass = L.active_tier === "high" ? "tier-high" : "tier-low";
+    const winPct = pct(L.window_used, L.max_per_window);
+    const winClass = winPct >= 95 ? "crit" : winPct >= 75 ? "warn" : "";
+    const concPct = pct(L.in_flight, L.max_concurrent);
+    const concClass = concPct >= 95 ? "crit" : concPct >= 75 ? "warn" : "";
+
+    document.getElementById("state-grid").innerHTML = `
+      <div class="stat">
+        <div class="label">Active Tier</div>
+        <div class="value ${tierClass}">${L.active_tier.toUpperCase()}</div>
+        <div class="sub">${L.forced_tier ? "forced" : "auto"}${L.probe_in_flight ? " · probing" : ""}</div>
+      </div>
+      <div class="stat">
+        <div class="label">In Flight</div>
+        <div class="value ${concClass}">${L.in_flight} / ${L.max_concurrent}</div>
+        <div class="sub">${concPct.toFixed(0)}%</div>
+      </div>
+      <div class="stat">
+        <div class="label">Queued</div>
+        <div class="value">${L.queued}</div>
+        <div class="sub">${L.queued > 0 ? "waiting for slot" : "idle"}</div>
+      </div>
+      <div class="stat">
+        <div class="label">Window Used</div>
+        <div class="value ${winClass}">${L.window_used} / ${L.max_per_window}</div>
+        <div class="sub">${winPct.toFixed(1)}% of ${(L.window_seconds/3600).toFixed(1)}h window</div>
+      </div>
+      <div class="stat">
+        <div class="label">Next Window Slot</div>
+        <div class="value">${fmtCountdown(L.next_window_slot_in_seconds)}</div>
+        <div class="sub">${L.next_window_slot_in_seconds == null ? "available now" : "paced"}</div>
+      </div>
+      <div class="stat">
+        <div class="label">Lifetime</div>
+        <div class="value">${L.totals.requests}</div>
+        <div class="sub">
+          ${L.totals.rate_limited} 429 · ${L.totals.promotions}↑ ${L.totals.demotions}↓ · ${L.totals.probes_sent} probes
+        </div>
+      </div>
+    `;
+
+    let tpHtml = "";
+    for (const w of WINDOWS) {
+      const s = m.overall[w] || {count:0, errors:0, avg_seconds:null, cost:null, input_tokens:0, output_tokens:0};
+      const errBadge = s.errors > 0 ? ` <span class="err">(${s.errors} err)</span>` : "";
+      const costBadge = s.cost !== null && s.cost !== undefined ? ` · ${fmtCost(s.cost)}` : "";
+      const tokSub = `${fmtNum(s.input_tokens + (s.cache_creation_input_tokens||0) + (s.cache_read_input_tokens||0))} in / ${fmtNum(s.output_tokens)} out`;
+      tpHtml += `
+        <div class="stat">
+          <div class="label">Last ${w}</div>
+          <div class="value">${s.count}</div>
+          <div class="sub">${fmtDur(s.avg_seconds)} avg${errBadge}${costBadge}</div>
+          <div class="sub">${tokSub}</div>
+        </div>
+      `;
+    }
+    document.getElementById("throughput-grid").innerHTML = tpHtml;
+
+    document.getElementById("overall-table").innerHTML = renderWindowTable(m.overall);
+    document.getElementById("overall-tokens-table").innerHTML = renderTokenTable(m.overall);
+
+    const models = Object.keys(m.per_model).sort();
+    if (models.length === 0) {
+      document.getElementById("per-model").innerHTML = `<div class="empty">No model traffic yet.</div>`;
+    } else {
+      let html = "";
+      for (const model of models) {
+        const d = m.per_model[model];
+        const active = d.active || 0;
+        const priced = d.has_pricing ? "" : ' <span class="model-active">(no pricing)</span>';
+        html += `
+          <div class="model-card">
+            <div class="model-head">
+              <div class="model-name">${model}${priced}</div>
+              <div class="model-active">active: <strong>${active}</strong></div>
+            </div>
+            <table>${renderWindowTable(d)}</table>
+            <div style="height:8px"></div>
+            <table>${renderTokenTable(d)}</table>
+          </div>
+        `;
+      }
+      document.getElementById("per-model").innerHTML = html;
+    }
+  } catch (e) {
+    const el = document.getElementById("live");
+    el.textContent = "✗ disconnected: " + e.message;
+    el.classList.add("error");
+  }
+}
+document.getElementById("boost-btn").addEventListener("click", async () => {
+  const btn = document.getElementById("boost-btn");
+  btn.disabled = true;
+  try {
+    const r = await fetch("/_proxy/boost", { method: "POST" });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      alert(e.error || ("boost failed: HTTP " + r.status));
+    }
+  } catch (e) {
+    alert("boost failed: " + e.message);
+  }
+  tick();
+});
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/_proxy/", response_class=HTMLResponse)
+@app.get("/_proxy", response_class=HTMLResponse)
+async def dashboard():
+    return HTMLResponse(DASHBOARD_HTML)
+
+
+@app.get("/_proxy/metrics")
+async def metrics_endpoint():
+    return {
+        "upstream": config["upstream_base_url"],
+        "limiter": limiter.snapshot(),
+        **metrics.summary(),
+    }
+
+
+@app.get("/_proxy/status")
+async def status_endpoint():
+    return limiter.snapshot()
+
+
+def _fmt_dur_short(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+@app.get("/_proxy/statusline", response_class=PlainTextResponse)
+async def statusline_endpoint(req: Request):
+    """Compact one-line status for tmux / Claude Code status bars.
+
+    Query params:
+      fmt=plain | tmux | ansi   (default: plain)
+      window=1m | 10m | 1h | 5h | 24h   (which throughput window to show; default 1m)
+    """
+    fmt = req.query_params.get("fmt", "plain")
+    window = req.query_params.get("window", "1m")
+    if window not in {w for w, _ in METRIC_WINDOWS}:
+        window = "1m"
+
+    snap = limiter.snapshot()
+    summ = metrics.summary()
+    tier = snap["active_tier"].upper()
+    w = summ["overall"].get(window, {"count": 0, "errors": 0, "avg_seconds": None})
+
+    def color(s: str, name: str) -> str:
+        if fmt == "tmux":
+            mapping = {
+                "green":  "#[fg=green]",
+                "yellow": "#[fg=yellow]",
+                "red":    "#[fg=red]",
+                "cyan":   "#[fg=cyan]",
+                "reset":  "#[default]",
+            }
+        elif fmt == "ansi":
+            mapping = {
+                "green":  "\x1b[32m",
+                "yellow": "\x1b[33m",
+                "red":    "\x1b[31m",
+                "cyan":   "\x1b[36m",
+                "reset":  "\x1b[0m",
+            }
+        else:
+            return s
+        return f"{mapping[name]}{s}{mapping['reset']}"
+
+    tier_color = "green" if tier == "HIGH" else "yellow"
+    queued_color = "red" if snap["queued"] > 0 else "reset"
+    err_color = "red" if w["errors"] > 0 else "reset"
+
+    parts = [
+        color(tier, tier_color),
+        f"{snap['in_flight']}/{snap['max_concurrent']}",
+        color(f"q{snap['queued']}", queued_color) if snap['queued'] > 0 else f"q{snap['queued']}",
+        f"w{snap['window_used']}/{snap['max_per_window']}",
+        f"{window}:{w['count']}",
+        _fmt_dur_short(w["avg_seconds"]),
+    ]
+    if req.query_params.get("cost") in ("1", "true", "yes") and w.get("cost") is not None:
+        c = w["cost"]
+        if c < 0.01:
+            cs = "<$0.01"
+        elif c < 1:
+            cs = f"${c:.3f}"
+        elif c < 100:
+            cs = f"${c:.2f}"
+        else:
+            cs = f"${c:.0f}"
+        parts.append(cs)
+    if w["errors"] > 0:
+        parts.append(color(f"!{w['errors']}err", err_color))
+    if snap.get("probe_in_flight"):
+        parts.append(color("probe", "cyan"))
+
+    return " ".join(parts)
+
+
+@app.get("/_proxy/config")
+async def config_endpoint():
+    return {"path": str(CONFIG_PATH), "loaded_mtime": config_mtime, "values": config}
+
+
+@app.post("/_proxy/force_tier")
+async def force_tier_endpoint(req: Request):
+    body = await req.json()
+    tier = body.get("tier")
+    if tier not in (None, "low", "high"):
+        return JSONResponse({"error": "tier must be 'low', 'high', or null"}, status_code=400)
+    cfg = {**config, "force_tier": tier}
+    await apply_config_change(cfg)
+    return limiter.snapshot()
+
+
+@app.post("/_proxy/boost")
+async def boost_endpoint():
+    """Temporarily switch to HIGH, keeping auto-demotion enabled.
+
+    The first rate-limited response (429/503/529) drops back to LOW on its own.
+    Use force_tier="high" instead if you want HIGH pinned permanently.
+    """
+    ok = await limiter.boost_high()
+    if not ok:
+        return JSONResponse(
+            {"error": "cannot boost while force_tier is set; clear force_tier first"},
+            status_code=409,
+        )
+    return limiter.snapshot()
+
+
+# ---------- Proxy handler ----------
+
+@app.api_route(
+    "/{full_path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
+)
+async def proxy(full_path: str, request: Request):
+    body = await request.body()
+    target = "/" + full_path
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP
+    }
+    model = extract_model(request.method, body)
+    started_at = metrics.request_started(model)
+
+    finished = False
+    handed_off = False
+
+    def finalize(status: int, usage: dict | None = None) -> None:
+        nonlocal finished
+        if not finished:
+            finished = True
+            metrics.request_finished(model, started_at, status, usage)
+
+    try:
+        max_attempts = int(config["retry_max_attempts"])
+        for attempt in range(1, max_attempts + 1):
+            was_probe = await limiter.acquire()
+            try:
+                outbound = client.build_request(
+                    method=request.method, url=target,
+                    content=body, headers=headers,
+                )
+                response = await client.send(outbound, stream=True)
+            except httpx.HTTPError as e:
+                await limiter.release_other_error(was_probe)
+                log.warning(f"upstream error attempt={attempt}/{max_attempts}: {e!r}")
+                if attempt >= max_attempts:
+                    finalize(502)
+                    return JSONResponse(
+                        {"error": "upstream_unreachable", "detail": str(e)},
+                        status_code=502,
+                    )
+                await asyncio.sleep(compute_backoff(attempt, None))
+                continue
+
+            if response.status_code in RATE_LIMIT_STATUSES:
+                retry_after = parse_retry_after(response.headers.get("retry-after"))
+                try:
+                    rl_body = await response.aread()
+                finally:
+                    await response.aclose()
+                await limiter.release_rate_limited(was_probe)
+                log.info(
+                    f"upstream {response.status_code} attempt={attempt}/{max_attempts} "
+                    f"retry_after={retry_after} probe={was_probe}"
+                )
+                if attempt >= max_attempts:
+                    finalize(response.status_code)
+                    return Response(
+                        content=rl_body,
+                        status_code=response.status_code,
+                        headers={
+                            k: v for k, v in response.headers.items()
+                            if k.lower() not in HOP_BY_HOP
+                        },
+                    )
+                await asyncio.sleep(compute_backoff(attempt, retry_after))
+                continue
+
+            is_success = 200 <= response.status_code < 400
+            status_code = response.status_code
+            out_headers = {
+                k: v for k, v in response.headers.items()
+                if k.lower() not in HOP_BY_HOP
+            }
+            extractor = make_extractor(response.headers.get("content-type", ""))
+
+            async def body_stream():
+                try:
+                    async for chunk in response.aiter_bytes():
+                        extractor.feed(chunk)
+                        yield chunk
+                finally:
+                    try:
+                        await response.aclose()
+                    except Exception:
+                        pass
+                    if is_success:
+                        await limiter.release_success(was_probe)
+                    else:
+                        await limiter.release_other_error(was_probe)
+                    usage = extractor.final_usage() if is_success else None
+                    finalize(status_code, usage)
+
+            handed_off = True
+            return StreamingResponse(
+                body_stream(),
+                status_code=status_code,
+                headers=out_headers,
+            )
+
+        finalize(502)
+        return JSONResponse({"error": "exhausted_retries"}, status_code=502)
+    finally:
+        if not handed_off and not finished:
+            metrics.request_finished(model, started_at, 0)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=config["listen_host"],
+        port=int(config["listen_port"]),
+        log_level=str(config.get("log_level", "info")).lower(),
+        access_log=False,
+    )

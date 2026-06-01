@@ -1,0 +1,64 @@
+# anthropic_proxy config — edit and save; the proxy hot-reloads.
+# Hot-reloadable: tiers, force_tier, log_level, retry_*, upstream_timeout,
+#                 promotion_cooldown_seconds, config_poll_seconds.
+# Restart required: upstream_base_url, listen_host, listen_port.
+
+# Where to forward requests. Set this to your custom Anthropic-compatible service.
+upstream_base_url: "https://api.anthropic.com"
+
+# Local listening socket for Claude Code to connect to.
+listen_host: "127.0.0.1"
+listen_port: 8787
+
+# Which tier to assume at startup. The proxy will auto-switch from here based
+# on what upstream actually accepts.
+initial_tier: "low"   # "low" | "high"
+
+# Manual override. null = auto-detect (recommended). Set to "low" or "high" to
+# pin a specific tier and disable auto-tier switching.
+force_tier: null
+
+# The two tiers. Coupled: a tier change swaps BOTH the concurrency cap and
+# the rolling per-window cap.
+tiers:
+  low:
+    max_concurrent: 4
+    window_seconds: 18000     # 5h
+    max_per_window: 600
+  high:
+    max_concurrent: 1000
+    window_seconds: 3600      # 1h
+    max_per_window: 9999
+
+# After a HIGH->LOW demotion (or a failed probe), wait this many seconds before
+# trying to probe HIGH again.
+promotion_cooldown_seconds: 300
+
+# Retry behavior when upstream returns 429/503/529 or connection errors.
+retry_max_attempts: 12
+retry_base_delay: 1.0     # seconds; doubled each attempt
+retry_max_delay: 60.0     # cap per backoff sleep
+upstream_timeout: 600     # per-request timeout (seconds)
+
+log_level: "INFO"         # DEBUG | INFO | WARNING | ERROR
+
+# How often the proxy checks this config file for changes.
+config_poll_seconds: 2.0
+
+# Optional per-model pricing for cost calculation (per 1,000,000 tokens, in
+# whatever unit your provider bills in — dollars, credits, etc.).
+# - If a model isn't listed, its cost shows as "—" on the dashboard.
+# - If cache_creation / cache_read are omitted, they default to the input rate.
+# Uncomment + edit to your provider's actual rates.
+model_pricing: {}
+# model_pricing:
+#   claude-opus-4-7:
+#     input: 15.0
+#     output: 75.0
+#     cache_creation: 18.75
+#     cache_read: 1.50
+#   claude-sonnet-4-6:
+#     input: 3.0
+#     output: 15.0
+#     cache_creation: 3.75
+#     cache_read: 0.30
