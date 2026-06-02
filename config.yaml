@@ -3,7 +3,10 @@
 #                 promotion_cooldown_seconds, config_poll_seconds.
 # Restart required: upstream_base_url, listen_host, listen_port.
 
-# Where to forward requests. Set this to your custom Anthropic-compatible service.
+# Where to forward requests. Set this to your custom service. Every path/header
+# is forwarded verbatim, so the same upstream can serve both the Anthropic
+# Messages API (/v1/messages) and the OpenAI-compatible API
+# (/v1/chat/completions, /v1/responses) — both flow through the same queue.
 upstream_base_url: "https://api.anthropic.com"
 
 # Local listening socket for Claude Code to connect to.
@@ -18,17 +21,16 @@ initial_tier: "low"   # "low" | "high"
 # pin a specific tier and disable auto-tier switching.
 force_tier: null
 
-# The two tiers. Coupled: a tier change swaps BOTH the concurrency cap and
-# the rolling per-window cap.
+# The two tiers — each is just a max concurrency cap. There is no preemptive
+# per-window pacing: requests are admitted as fast as the cap allows, and when
+# upstream rate-limits (429/503/529) the proxy retries with backoff so callers
+# wait then. The proxy auto-detects which cap upstream currently allows by
+# probing HIGH when LOW is saturated (see promotion_cooldown_seconds).
 tiers:
   low:
     max_concurrent: 4
-    window_seconds: 18000     # 5h
-    max_per_window: 600
   high:
     max_concurrent: 1000
-    window_seconds: 3600      # 1h
-    max_per_window: 9999
 
 # After a HIGH->LOW demotion (or a failed probe), wait this many seconds before
 # trying to probe HIGH again.
@@ -62,3 +64,11 @@ model_pricing: {}
 #     output: 15.0
 #     cache_creation: 3.75
 #     cache_read: 0.30
+#   # OpenAI-compatible models are keyed the same way (by the `model` field).
+#   # OpenAI bills cached input cheaper and has no cache-write charge, so set
+#   # cache_read and leave cache_creation unset (it defaults to the input rate
+#   # but no cache-write tokens are ever reported for OpenAI).
+#   gpt-4o:
+#     input: 2.5
+#     output: 10.0
+#     cache_read: 1.25

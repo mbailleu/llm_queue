@@ -8,11 +8,18 @@
 # ]
 # ///
 """
-anthropic_proxy — queueing proxy for the Anthropic /v1/messages API.
+anthropic_proxy — queueing proxy for LLM APIs.
 
-Two-tier model (coupled):
-  - LOW:  max_concurrent=4,    600 req / 5h
-  - HIGH: max_concurrent=1000, 9999 req / 1h
+Forwards every path/header verbatim, so it fronts both the Anthropic Messages
+API (/v1/messages) and the OpenAI-compatible API (/v1/chat/completions,
+/v1/responses) through one shared queue. Token/cost metrics understand all
+three usage shapes.
+
+Two concurrency tiers, auto-detected by probing under load:
+  - LOW:  max_concurrent=4
+  - HIGH: max_concurrent=1000
+There is no preemptive rate pacing; when upstream returns 429/503/529 the
+request is retried with backoff (honoring Retry-After) and callers wait.
 
 Web dashboard at  http://<host>:<port>/_proxy/
 Raw metrics JSON  http://<host>:<port>/_proxy/metrics
@@ -44,8 +51,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "initial_tier": "low",
     "force_tier": None,
     "tiers": {
-        "low":  {"max_concurrent": 4,    "window_seconds": 18000, "max_per_window": 600},
-        "high": {"max_concurrent": 1000, "window_seconds": 3600,  "max_per_window": 9999},
+        "low":  {"max_concurrent": 4},
+        "high": {"max_concurrent": 1000},
     },
     "promotion_cooldown_seconds": 300,
     "retry_max_attempts": 12,
@@ -76,17 +83,20 @@ log = logging.getLogger("proxy")
 # ---------- Tier + Limiter ----------
 
 class Tier:
-    __slots__ = ("name", "max_concurrent", "window_seconds", "max_per_window")
+    __slots__ = ("name", "max_concurrent")
 
-    def __init__(self, name: str, max_concurrent: int, window_seconds: float, max_per_window: int):
+    def __init__(self, name: str, max_concurrent: int):
         self.name = name
         self.max_concurrent = max_concurrent
-        self.window_seconds = window_seconds
-        self.max_per_window = max_per_window
 
 
 class Limiter:
-    """Concurrency + rolling-window throttle with auto-tier-detection."""
+    """Concurrency cap (with a queue) plus auto-tier-detection.
+
+    There is no preemptive per-window pacing: requests are admitted as fast as
+    the concurrency cap allows. When the upstream rate limit is hit, the 429/
+    503/529 retry+backoff in the proxy handler is what makes callers wait.
+    """
 
     def __init__(self, low: Tier, high: Tier, initial_tier: str,
                  promotion_cooldown: float, forced: str | None):
@@ -101,21 +111,14 @@ class Limiter:
         self._last_demotion = 0.0
         self._in_flight = 0
         self._waiters = 0
-        self._recent_starts: deque[float] = deque()
         self._probe_in_flight = False
         self._n_requests = 0
         self._n_rate_limited = 0
         self._n_other_errors = 0
         self._n_concurrency_waits = 0
-        self._n_paced_waits = 0
         self._n_promotions = 0
         self._n_demotions = 0
         self._n_probes_sent = 0
-
-    def _prune_window(self, now: float) -> None:
-        cutoff = now - self._active.window_seconds
-        while self._recent_starts and self._recent_starts[0] < cutoff:
-            self._recent_starts.popleft()
 
     async def acquire(self) -> bool:
         async with self._cond:
@@ -123,20 +126,9 @@ class Limiter:
             try:
                 while True:
                     now = time.monotonic()
-                    self._prune_window(now)
-
-                    if len(self._recent_starts) >= self._active.max_per_window:
-                        wait = self._recent_starts[0] + self._active.window_seconds - now
-                        self._n_paced_waits += 1
-                        try:
-                            await asyncio.wait_for(self._cond.wait(), timeout=max(0.05, wait))
-                        except asyncio.TimeoutError:
-                            pass
-                        continue
 
                     if self._in_flight < self._active.max_concurrent:
                         self._in_flight += 1
-                        self._recent_starts.append(now)
                         self._n_requests += 1
                         return False
 
@@ -149,7 +141,6 @@ class Limiter:
                     )
                     if can_probe:
                         self._in_flight += 1
-                        self._recent_starts.append(now)
                         self._n_requests += 1
                         self._probe_in_flight = True
                         self._n_probes_sent += 1
@@ -173,8 +164,7 @@ class Limiter:
                     self._active = self._high
                     self._n_promotions += 1
                     log.warning(
-                        f"tier promoted LOW -> HIGH (cap conc={self._high.max_concurrent}, "
-                        f"{self._high.max_per_window}/{int(self._high.window_seconds)}s)"
+                        f"tier promoted LOW -> HIGH (max_concurrent={self._high.max_concurrent})"
                     )
             self._cond.notify_all()
 
@@ -193,8 +183,7 @@ class Limiter:
                 self._n_demotions += 1
                 self._last_demotion = now
                 log.warning(
-                    f"tier demoted HIGH -> LOW (cap conc={self._low.max_concurrent}, "
-                    f"{self._low.max_per_window}/{int(self._low.window_seconds)}s)"
+                    f"tier demoted HIGH -> LOW (max_concurrent={self._low.max_concurrent})"
                 )
             self._cond.notify_all()
 
@@ -221,8 +210,7 @@ class Limiter:
                 self._n_promotions += 1
                 log.warning(
                     "tier boosted LOW -> HIGH (temporary; auto-demotes on "
-                    f"rate-limit; cap conc={self._high.max_concurrent}, "
-                    f"{self._high.max_per_window}/{int(self._high.window_seconds)}s)"
+                    f"rate-limit; max_concurrent={self._high.max_concurrent})"
                 )
             self._cond.notify_all()
             return True
@@ -243,33 +231,18 @@ class Limiter:
             self._cond.notify_all()
 
     def snapshot(self) -> dict[str, Any]:
-        now = time.monotonic()
-        self._prune_window(now)
-        next_window_slot_in = None
-        if (
-            self._recent_starts
-            and len(self._recent_starts) >= self._active.max_per_window
-        ):
-            next_window_slot_in = max(
-                0.0, self._recent_starts[0] + self._active.window_seconds - now
-            )
         return {
             "active_tier": self._active.name,
             "forced_tier": self._forced,
             "max_concurrent": self._active.max_concurrent,
-            "max_per_window": self._active.max_per_window,
-            "window_seconds": self._active.window_seconds,
             "in_flight": self._in_flight,
             "queued": self._waiters,
-            "window_used": len(self._recent_starts),
-            "next_window_slot_in_seconds": next_window_slot_in,
             "probe_in_flight": self._probe_in_flight,
             "totals": {
                 "requests": self._n_requests,
                 "rate_limited": self._n_rate_limited,
                 "other_errors": self._n_other_errors,
                 "concurrency_waits": self._n_concurrency_waits,
-                "paced_waits": self._n_paced_waits,
                 "promotions": self._n_promotions,
                 "demotions": self._n_demotions,
                 "probes_sent": self._n_probes_sent,
@@ -279,13 +252,71 @@ class Limiter:
 
 # ---------- Metrics ----------
 
+def normalize_usage(usage: Any) -> dict | None:
+    """Map a provider `usage` block to our canonical 4-field shape.
+
+    Handles three wire formats:
+      - Anthropic Messages:   input_tokens / output_tokens /
+                              cache_creation_input_tokens / cache_read_input_tokens
+      - OpenAI Responses:     input_tokens / output_tokens, with the cached
+                              subset in input_tokens_details.cached_tokens
+                              (input_tokens is inclusive of cached)
+      - OpenAI Chat/Completions: prompt_tokens / completion_tokens, with the
+                              cached subset in prompt_tokens_details.cached_tokens
+                              (prompt_tokens is inclusive of cached)
+
+    For the OpenAI shapes we split the cached tokens out of the prompt so
+    `input_tokens` and `cache_read_input_tokens` stay disjoint (matching how
+    Anthropic reports them, and how the per-token pricing is applied).
+    OpenAI has no separate cache-write charge, so cache_creation stays 0.
+    """
+    if not isinstance(usage, dict):
+        return None
+
+    if "input_tokens" in usage or "output_tokens" in usage:
+        inp = int(usage.get("input_tokens", 0) or 0)
+        out = int(usage.get("output_tokens", 0) or 0)
+        cc = int(usage.get("cache_creation_input_tokens", 0) or 0)
+        cr = int(usage.get("cache_read_input_tokens", 0) or 0)
+        details = usage.get("input_tokens_details")
+        if isinstance(details, dict) and "cached_tokens" in details:
+            # OpenAI Responses API: input_tokens is inclusive of cached.
+            cr = int(details.get("cached_tokens", 0) or 0)
+            inp = max(0, inp - cr)
+        return {
+            "input_tokens": inp,
+            "output_tokens": out,
+            "cache_creation_input_tokens": cc,
+            "cache_read_input_tokens": cr,
+        }
+
+    if "prompt_tokens" in usage or "completion_tokens" in usage:
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+        completion = int(usage.get("completion_tokens", 0) or 0)
+        details = usage.get("prompt_tokens_details")
+        cached = 0
+        if isinstance(details, dict):
+            cached = int(details.get("cached_tokens", 0) or 0)
+        return {
+            "input_tokens": max(0, prompt - cached),
+            "output_tokens": completion,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": cached,
+        }
+
+    return None
+
+
 class SSEUsageExtractor:
-    """Watches an SSE byte stream for /v1/messages usage info.
+    """Watches an SSE byte stream for usage info (Anthropic + OpenAI).
 
     Anthropic emits a `message_start` event whose data contains
     `message.usage` (input_tokens, cache_*), and a `message_delta` event whose
-    data contains `usage.output_tokens`. We accumulate the latest values and
-    return them once the stream ends.
+    data contains `usage.output_tokens`. OpenAI Chat Completions emit a final
+    chunk carrying a top-level `usage` (only when the client sets
+    `stream_options.include_usage`); the OpenAI Responses API nests usage under
+    `response.usage` on `response.completed`. We accumulate field-wise maxima
+    across whatever arrives and return them once the stream ends.
     """
 
     def __init__(self) -> None:
@@ -326,25 +357,29 @@ class SSEUsageExtractor:
             return
         et = obj.get("type")
         if et == "message_start":
-            usage = (obj.get("message") or {}).get("usage") or {}
-            self._merge(usage)
-        elif et == "message_delta":
-            self._merge(obj.get("usage") or {})
+            self._merge((obj.get("message") or {}).get("usage"))
+            return
+        if et == "message_delta":
+            self._merge(obj.get("usage"))
+            return
+        # OpenAI Responses API: usage rides on response.completed/.incomplete.
+        resp = obj.get("response")
+        if isinstance(resp, dict) and isinstance(resp.get("usage"), dict):
+            self._merge(resp["usage"])
+            return
+        # OpenAI Chat Completions: final chunk carries a top-level usage.
+        if isinstance(obj.get("usage"), dict):
+            self._merge(obj["usage"])
 
-    def _merge(self, usage: dict) -> None:
+    def _merge(self, usage: Any) -> None:
+        norm = normalize_usage(usage)
+        if norm is None:
+            return
         self._got_any = True
-        if "input_tokens" in usage:
-            self._input = max(self._input, int(usage.get("input_tokens") or 0))
-        if "output_tokens" in usage:
-            self._output = max(self._output, int(usage.get("output_tokens") or 0))
-        if "cache_creation_input_tokens" in usage:
-            self._cache_creation = max(
-                self._cache_creation, int(usage.get("cache_creation_input_tokens") or 0)
-            )
-        if "cache_read_input_tokens" in usage:
-            self._cache_read = max(
-                self._cache_read, int(usage.get("cache_read_input_tokens") or 0)
-            )
+        self._input = max(self._input, norm["input_tokens"])
+        self._output = max(self._output, norm["output_tokens"])
+        self._cache_creation = max(self._cache_creation, norm["cache_creation_input_tokens"])
+        self._cache_read = max(self._cache_read, norm["cache_read_input_tokens"])
 
     def final_usage(self) -> dict | None:
         if not self._got_any:
@@ -358,7 +393,11 @@ class SSEUsageExtractor:
 
 
 class JSONUsageExtractor:
-    """Buffers a non-streaming JSON response body and extracts top-level usage."""
+    """Buffers a non-streaming JSON response body and extracts top-level usage.
+
+    Works for Anthropic Messages and OpenAI Chat Completions / Responses, all of
+    which put a `usage` object at the top level of the response body.
+    """
 
     def __init__(self, max_bytes: int = 8 * 1024 * 1024) -> None:
         self._buf = bytearray()
@@ -383,15 +422,7 @@ class JSONUsageExtractor:
             return None
         if not isinstance(obj, dict):
             return None
-        usage = obj.get("usage")
-        if not isinstance(usage, dict):
-            return None
-        return {
-            "input_tokens": int(usage.get("input_tokens", 0) or 0),
-            "output_tokens": int(usage.get("output_tokens", 0) or 0),
-            "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens", 0) or 0),
-            "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
-        }
+        return normalize_usage(obj.get("usage"))
 
 
 def make_extractor(content_type: str):
@@ -600,12 +631,7 @@ def load_config_file() -> dict[str, Any]:
 
 def make_tier(cfg: dict[str, Any], name: str) -> Tier:
     t = cfg["tiers"][name]
-    return Tier(
-        name=name,
-        max_concurrent=int(t["max_concurrent"]),
-        window_seconds=float(t["window_seconds"]),
-        max_per_window=int(t["max_per_window"]),
-    )
+    return Tier(name=name, max_concurrent=int(t["max_concurrent"]))
 
 
 def init_from_config(cfg: dict[str, Any]) -> tuple[Limiter, Metrics]:
@@ -871,12 +897,6 @@ function fmtDur(s) {
   if (s < 3600) return (s / 60).toFixed(1) + "m";
   return (s / 3600).toFixed(2) + "h";
 }
-function fmtCountdown(s) {
-  if (s === null || s === undefined) return "—";
-  if (s < 60)  return s.toFixed(0) + "s";
-  if (s < 3600) return (s / 60).toFixed(1) + "m";
-  return (s / 3600).toFixed(2) + "h";
-}
 function fmtNum(n) {
   if (n === null || n === undefined) return "—";
   if (n === 0) return "0";
@@ -958,8 +978,6 @@ async function tick() {
       boostBtn.textContent = "⚡ Boost HIGH";
     }
     const tierClass = L.active_tier === "high" ? "tier-high" : "tier-low";
-    const winPct = pct(L.window_used, L.max_per_window);
-    const winClass = winPct >= 95 ? "crit" : winPct >= 75 ? "warn" : "";
     const concPct = pct(L.in_flight, L.max_concurrent);
     const concClass = concPct >= 95 ? "crit" : concPct >= 75 ? "warn" : "";
 
@@ -978,16 +996,6 @@ async function tick() {
         <div class="label">Queued</div>
         <div class="value">${L.queued}</div>
         <div class="sub">${L.queued > 0 ? "waiting for slot" : "idle"}</div>
-      </div>
-      <div class="stat">
-        <div class="label">Window Used</div>
-        <div class="value ${winClass}">${L.window_used} / ${L.max_per_window}</div>
-        <div class="sub">${winPct.toFixed(1)}% of ${(L.window_seconds/3600).toFixed(1)}h window</div>
-      </div>
-      <div class="stat">
-        <div class="label">Next Window Slot</div>
-        <div class="value">${fmtCountdown(L.next_window_slot_in_seconds)}</div>
-        <div class="sub">${L.next_window_slot_in_seconds == null ? "available now" : "paced"}</div>
       </div>
       <div class="stat">
         <div class="label">Lifetime</div>
@@ -1148,7 +1156,6 @@ async def statusline_endpoint(req: Request):
         color(tier, tier_color),
         f"{snap['in_flight']}/{snap['max_concurrent']}",
         color(f"q{snap['queued']}", queued_color) if snap['queued'] > 0 else f"q{snap['queued']}",
-        f"w{snap['window_used']}/{snap['max_per_window']}",
         f"{window}:{w['count']}",
         _fmt_dur_short(w["avg_seconds"]),
     ]
