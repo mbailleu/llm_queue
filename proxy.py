@@ -68,6 +68,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # indicator. Tracked, not enforced.
     "rate_window_seconds": 18000,   # 5h
     "rate_window_limit": 600,
+    # Per-model weighting for the window count: a request for a listed model
+    # counts as `factor` requests toward the window (only the window — metrics
+    # and per-model stats still count each request once). Models not listed use
+    # `default_window_weight`. Keys match by exact model name first, then by
+    # substring (so "opus" matches "claude-opus-4-20250514").
+    "model_window_weights": {},
+    "default_window_weight": 1,
     "upstream_timeout": 600,
     "log_level": "INFO",
     "config_poll_seconds": 2.0,
@@ -114,7 +121,9 @@ class Limiter:
 
     def __init__(self, low: Tier, high: Tier, initial_tier: str,
                  promotion_cooldown: float, forced: str | None,
-                 window_seconds: float = 18000.0, window_limit: int = 600):
+                 window_seconds: float = 18000.0, window_limit: int = 600,
+                 window_weights: dict[str, float] | None = None,
+                 default_window_weight: float = 1.0):
         self._cond = asyncio.Condition()
         self._low = low
         self._high = high
@@ -133,8 +142,12 @@ class Limiter:
         # Tracked for display; not enforced (upstream 429s + retry do that).
         self._window_seconds = float(window_seconds)
         self._window_limit = int(window_limit)
+        # Per-model window weighting. Each entry maps a model (matched exactly,
+        # then by substring) to how many "requests" it costs the window count.
+        self._window_weights: dict[str, float] = dict(window_weights or {})
+        self._default_window_weight = float(default_window_weight)
         self._window_start: float | None = None
-        self._window_count = 0
+        self._window_count = 0.0
         self._n_requests = 0
         self._n_rate_limited = 0
         self._n_other_errors = 0
@@ -143,18 +156,37 @@ class Limiter:
         self._n_demotions = 0
         self._n_probes_sent = 0
 
-    def note_request(self) -> None:
+    def _window_weight_for(self, model: str) -> float:
+        """How many window-units a request for `model` costs.
+
+        Exact match wins; otherwise the first configured key that is a substring
+        of the model name (so "opus" matches "claude-opus-4-20250514"); else the
+        default weight. Only affects the rolling window count, not statistics.
+        """
+        if model in self._window_weights:
+            return float(self._window_weights[model])
+        for key, w in self._window_weights.items():
+            if key and key in model:
+                return float(w)
+        return self._default_window_weight
+
+    def note_request(self, model: str = "") -> float:
         """Count one client request against the rolling quota window.
 
-        Called once per client request (not per retry). Starts a fresh window
-        when there is none active or the current one has elapsed. Synchronous
-        and await-free, so it's atomic under the single-threaded event loop.
+        Called once per client request (not per retry). The request counts as
+        `_window_weight_for(model)` units toward the window (a per-model factor);
+        this affects only the window indicator, never the per-request metrics or
+        per-model stats. Starts a fresh window when there is none active or the
+        current one has elapsed. Synchronous and await-free, so it's atomic under
+        the single-threaded event loop. Returns the weight applied.
         """
         now = time.time()
         if self._window_start is None or now - self._window_start >= self._window_seconds:
             self._window_start = now
-            self._window_count = 0
-        self._window_count += 1
+            self._window_count = 0.0
+        weight = self._window_weight_for(model)
+        self._window_count += weight
+        return weight
 
     def _window_snapshot(self) -> dict[str, Any]:
         now = time.time()
@@ -171,11 +203,12 @@ class Limiter:
                 "remaining_seconds": None,
             }
         elapsed = now - ws
+        count = self._window_count
         return {
             "active": True,
             "limit": self._window_limit,
             "window_seconds": self._window_seconds,
-            "count": self._window_count,
+            "count": int(count) if float(count).is_integer() else round(count, 2),
             "started_at": ws,
             "elapsed_seconds": elapsed,
             "remaining_seconds": max(0.0, self._window_seconds - elapsed),
@@ -279,7 +312,9 @@ class Limiter:
     async def update_tiers(self, low: Tier, high: Tier,
                            promotion_cooldown: float, forced: str | None,
                            window_seconds: float | None = None,
-                           window_limit: int | None = None) -> None:
+                           window_limit: int | None = None,
+                           window_weights: dict[str, float] | None = None,
+                           default_window_weight: float | None = None) -> None:
         async with self._cond:
             self._low = low
             self._high = high
@@ -289,6 +324,10 @@ class Limiter:
                 self._window_seconds = float(window_seconds)
             if window_limit is not None:
                 self._window_limit = int(window_limit)
+            if window_weights is not None:
+                self._window_weights = dict(window_weights)
+            if default_window_weight is not None:
+                self._default_window_weight = float(default_window_weight)
             if self._forced == "low":
                 self._active = self._low
             elif self._forced == "high":
@@ -1000,8 +1039,37 @@ def make_tier(cfg: dict[str, Any], name: str) -> Tier:
     return Tier(name=name, max_concurrent=int(t["max_concurrent"]))
 
 
+def parse_window_weights(cfg: dict[str, Any]) -> tuple[dict[str, float], float]:
+    """Read per-model window weights + default weight from config, validated.
+
+    Non-positive or non-numeric weights are dropped/ignored (falling back to the
+    default) so a bad config line can't silently zero out the window count.
+    """
+    raw = cfg.get("model_window_weights") or {}
+    weights: dict[str, float] = {}
+    if isinstance(raw, dict):
+        for model, w in raw.items():
+            try:
+                wf = float(w)
+            except (TypeError, ValueError):
+                log.warning(f"model_window_weights[{model!r}]={w!r} not numeric; ignored")
+                continue
+            if wf <= 0:
+                log.warning(f"model_window_weights[{model!r}]={w!r} must be > 0; ignored")
+                continue
+            weights[str(model)] = wf
+    try:
+        default = float(cfg.get("default_window_weight", 1))
+    except (TypeError, ValueError):
+        default = 1.0
+    if default <= 0:
+        default = 1.0
+    return weights, default
+
+
 def init_from_config(cfg: dict[str, Any]) -> tuple[Limiter, Metrics, PersistentStats]:
     forced = cfg.get("force_tier") if cfg.get("force_tier") in ("low", "high") else None
+    window_weights, default_window_weight = parse_window_weights(cfg)
     lim = Limiter(
         low=make_tier(cfg, "low"),
         high=make_tier(cfg, "high"),
@@ -1010,6 +1078,8 @@ def init_from_config(cfg: dict[str, Any]) -> tuple[Limiter, Metrics, PersistentS
         forced=forced,
         window_seconds=float(cfg.get("rate_window_seconds", 18000)),
         window_limit=int(cfg.get("rate_window_limit", 600)),
+        window_weights=window_weights,
+        default_window_weight=default_window_weight,
     )
     pricing = cfg.get("model_pricing") or {}
     if not isinstance(pricing, dict):
@@ -1035,6 +1105,7 @@ async def apply_config_change(new_cfg: dict[str, Any]) -> None:
     log_level = str(new_cfg.get("log_level", "INFO")).upper()
     logging.getLogger().setLevel(log_level)
     forced = new_cfg.get("force_tier") if new_cfg.get("force_tier") in ("low", "high") else None
+    window_weights, default_window_weight = parse_window_weights(new_cfg)
     await limiter.update_tiers(
         low=make_tier(new_cfg, "low"),
         high=make_tier(new_cfg, "high"),
@@ -1042,6 +1113,8 @@ async def apply_config_change(new_cfg: dict[str, Any]) -> None:
         forced=forced,
         window_seconds=float(new_cfg.get("rate_window_seconds", 18000)),
         window_limit=int(new_cfg.get("rate_window_limit", 600)),
+        window_weights=window_weights,
+        default_window_weight=default_window_weight,
     )
     metrics.set_max_age(float(new_cfg["metrics_window_seconds"]))
     new_pricing = new_cfg.get("model_pricing") or {}
@@ -1872,7 +1945,7 @@ async def proxy(full_path: str, request: Request):
     }
     model = extract_model(request.method, body)
     started_at = metrics.request_started(model)
-    limiter.note_request()
+    limiter.note_request(model)
 
     finished = False
     handed_off = False

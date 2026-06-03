@@ -58,6 +58,22 @@ upstream_timeout: 600          # per-request timeout (seconds)
 rate_window_seconds: 18000     # 5h
 rate_window_limit: 600         # requests per window (low tier)
 
+# Per-model weighting for the window count. A request for a listed model counts
+# as `factor` requests toward the "X / N this window" indicator above — e.g. an
+# Opus request can cost 2 or 4 while a Haiku request costs 1. This affects ONLY
+# the rolling window count; per-request metrics and per-model stats/counts still
+# count each request exactly once (no double-counting elsewhere).
+# Matching: exact model name first, then substring (so "opus" matches
+# "claude-opus-4-20250514"). Models not matched use default_window_weight.
+# Weights must be > 0; invalid entries are ignored (fall back to the default).
+default_window_weight: 1
+model_window_weights: {}
+# model_window_weights:
+#   claude-opus-4-7: 4
+#   opus: 4            # substring fallback for any opus model/date suffix
+#   claude-sonnet-4-6: 2
+#   claude-haiku: 1
+
 log_level: "INFO"         # DEBUG | INFO | WARNING | ERROR
 
 # How often the proxy checks this config file for changes.
