@@ -50,9 +50,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "listen_port": 8787,
     "initial_tier": "low",
     "force_tier": None,
+    # Each tier has a max concurrency cap and its own rolling request-quota
+    # window (window_limit requests per window_seconds). The active tier's window
+    # drives the dashboard indicator and restarts whenever the tier switches.
+    # window_seconds/window_limit fall back to the top-level rate_window_* below
+    # when a tier omits them.
     "tiers": {
-        "low":  {"max_concurrent": 4},
-        "high": {"max_concurrent": 1000},
+        "low":  {"max_concurrent": 4,    "window_seconds": 18000, "window_limit": 600},
+        "high": {"max_concurrent": 1000, "window_seconds": 3600,  "window_limit": 99999},
     },
     "promotion_cooldown_seconds": 300,
     "retry_max_attempts": 12,
@@ -64,8 +69,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # window and run once the quota resets. (retry_max_attempts still bounds
     # connection-error retries, which a long wait won't fix.)
     "retry_max_elapsed_seconds": 18900,
-    # Rolling request-quota window, for the dashboard "X / N this window"
-    # indicator. Tracked, not enforced.
+    # Fallback rolling request-quota window for the dashboard "X / N this window"
+    # indicator, used only when a tier omits its own window_seconds/window_limit.
+    # Tracked, not enforced.
     "rate_window_seconds": 18000,   # 5h
     "rate_window_limit": 600,
     # Per-model weighting for the window count: a request for a listed model
@@ -84,6 +90,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "stats_persist_path": "stats.json",
     "stats_flush_seconds": 60.0,
     "stats_retention_days": 120,
+    # Current rolling-window state (count + start) persisted across restarts.
+    # Restored on boot unless it has already elapsed past its window.
+    "window_persist_path": "window.json",
 }
 
 RATE_LIMIT_STATUSES = {429, 503, 529}
@@ -104,11 +113,19 @@ log = logging.getLogger("proxy")
 # ---------- Tier + Limiter ----------
 
 class Tier:
-    __slots__ = ("name", "max_concurrent")
+    __slots__ = ("name", "max_concurrent", "window_seconds", "window_limit")
 
-    def __init__(self, name: str, max_concurrent: int):
+    def __init__(self, name: str, max_concurrent: int,
+                 window_seconds: float = 18000.0, window_limit: int = 600):
         self.name = name
         self.max_concurrent = max_concurrent
+        # Each tier carries its own rolling request-quota window (the upstream
+        # "N requests per W seconds" budget for that tier). LOW is typically the
+        # small per-window quota; HIGH a large per-hour ceiling. The active
+        # tier's window is what the dashboard "X / N this window" indicator uses,
+        # and the counter restarts whenever the active tier changes.
+        self.window_seconds = float(window_seconds)
+        self.window_limit = int(window_limit)
 
 
 class Limiter:
@@ -121,7 +138,6 @@ class Limiter:
 
     def __init__(self, low: Tier, high: Tier, initial_tier: str,
                  promotion_cooldown: float, forced: str | None,
-                 window_seconds: float = 18000.0, window_limit: int = 600,
                  window_weights: dict[str, float] | None = None,
                  default_window_weight: float = 1.0):
         self._cond = asyncio.Condition()
@@ -136,18 +152,18 @@ class Limiter:
         self._in_flight = 0
         self._waiters = 0
         self._probe_in_flight = False
-        # Rolling request-quota window (the upstream "N requests per W seconds"
-        # budget). Anchored at the first request after the previous window
-        # expired, matching "the 5h starts when the first request is sent".
-        # Tracked for display; not enforced (upstream 429s + retry do that).
-        self._window_seconds = float(window_seconds)
-        self._window_limit = int(window_limit)
+        # Rolling request-quota window. The limit/duration come from the ACTIVE
+        # tier (LOW and HIGH each have their own), so they switch when the tier
+        # does. Anchored at the first request after the previous window expired,
+        # matching "the window starts when the first request is sent". Tracked
+        # for display; not enforced (upstream 429s + retry do that). The counter
+        # is restarted on every tier change (see _restart_window).
+        self._window_start: float | None = None
+        self._window_count = 0.0
         # Per-model window weighting. Each entry maps a model (matched exactly,
         # then by substring) to how many "requests" it costs the window count.
         self._window_weights: dict[str, float] = dict(window_weights or {})
         self._default_window_weight = float(default_window_weight)
-        self._window_start: float | None = None
-        self._window_count = 0.0
         self._n_requests = 0
         self._n_rate_limited = 0
         self._n_other_errors = 0
@@ -170,18 +186,32 @@ class Limiter:
                 return float(w)
         return self._default_window_weight
 
+    def _restart_window(self) -> None:
+        """Restart the rolling quota window for the (new) active tier.
+
+        Called on every tier change (promotion, demotion, boost, or a forced
+        switch) so the count and timer reset and the next request re-anchors a
+        fresh window under the new tier's limit/duration. Synchronous and
+        await-free; callers already hold `self._cond`.
+        """
+        self._window_start = None
+        self._window_count = 0.0
+
     def note_request(self, model: str = "") -> float:
         """Count one client request against the rolling quota window.
 
         Called once per client request (not per retry). The request counts as
         `_window_weight_for(model)` units toward the window (a per-model factor);
         this affects only the window indicator, never the per-request metrics or
-        per-model stats. Starts a fresh window when there is none active or the
-        current one has elapsed. Synchronous and await-free, so it's atomic under
-        the single-threaded event loop. Returns the weight applied.
+        per-model stats. The window's duration/limit come from the active tier,
+        so they follow tier changes. Starts a fresh window when there is none
+        active or the current one has elapsed. Synchronous and await-free, so
+        it's atomic under the single-threaded event loop. Returns the weight
+        applied.
         """
         now = time.time()
-        if self._window_start is None or now - self._window_start >= self._window_seconds:
+        window_seconds = float(self._active.window_seconds)
+        if self._window_start is None or now - self._window_start >= window_seconds:
             self._window_start = now
             self._window_count = 0.0
         weight = self._window_weight_for(model)
@@ -190,13 +220,16 @@ class Limiter:
 
     def _window_snapshot(self) -> dict[str, Any]:
         now = time.time()
+        window_seconds = float(self._active.window_seconds)
+        window_limit = int(self._active.window_limit)
         ws = self._window_start
-        active = ws is not None and now - ws < self._window_seconds
+        active = ws is not None and now - ws < window_seconds
         if not active:
             return {
                 "active": False,
-                "limit": self._window_limit,
-                "window_seconds": self._window_seconds,
+                "tier": self._active.name,
+                "limit": window_limit,
+                "window_seconds": window_seconds,
                 "count": 0,
                 "started_at": None,
                 "elapsed_seconds": None,
@@ -206,13 +239,78 @@ class Limiter:
         count = self._window_count
         return {
             "active": True,
-            "limit": self._window_limit,
-            "window_seconds": self._window_seconds,
+            "tier": self._active.name,
+            "limit": window_limit,
+            "window_seconds": window_seconds,
             "count": int(count) if float(count).is_integer() else round(count, 2),
             "started_at": ws,
             "elapsed_seconds": elapsed,
-            "remaining_seconds": max(0.0, self._window_seconds - elapsed),
+            "remaining_seconds": max(0.0, window_seconds - elapsed),
         }
+
+    # -- manual window overrides + persistence (sync, await-free: atomic under
+    #    the single-threaded loop, like note_request) --
+
+    def set_window_count(self, count: float) -> dict[str, Any]:
+        """Force the rolling window's current request count.
+
+        If no window is currently active (none started, or the last one expired)
+        a fresh one is anchored at now so the count is visible. Returns the new
+        window snapshot.
+        """
+        now = time.time()
+        if self._window_start is None or now - self._window_start >= float(self._active.window_seconds):
+            self._window_start = now
+        self._window_count = max(0.0, float(count))
+        return self._window_snapshot()
+
+    def set_window_start(self, started_at: float | None) -> dict[str, Any]:
+        """Force the rolling window's start timestamp (unix seconds).
+
+        `None` clears it, so the next request re-anchors a fresh window. Returns
+        the new window snapshot.
+        """
+        if started_at is None:
+            self._restart_window()
+        else:
+            self._window_start = float(started_at)
+        return self._window_snapshot()
+
+    def window_state(self) -> dict[str, Any]:
+        """Serializable window state for persistence across restarts."""
+        return {
+            "started_at": self._window_start,
+            "count": self._window_count,
+            "tier": self._active.name,
+            "window_seconds": float(self._active.window_seconds),
+        }
+
+    def load_window_state(self, state: dict[str, Any] | None) -> bool:
+        """Restore a persisted window, discarding it if it has already elapsed.
+
+        The saved window is dropped when `now - started_at` is past the window
+        duration (using the saved window's own duration), so a stale count from a
+        long-ago run never resurfaces. Returns True if a window was restored.
+        """
+        if not isinstance(state, dict):
+            return False
+        start = state.get("started_at")
+        if start is None:
+            return False
+        try:
+            start = float(start)
+            count = max(0.0, float(state.get("count", 0) or 0))
+            window_seconds = float(state.get("window_seconds")
+                                   or self._active.window_seconds)
+        except (TypeError, ValueError):
+            return False
+        if time.time() - start >= window_seconds:
+            log.info("window: persisted state already elapsed; discarded")
+            return False
+        self._window_start = start
+        self._window_count = count
+        log.info(f"window: restored count={count} started_at={start}")
+        return True
 
     async def acquire(self) -> bool:
         async with self._cond:
@@ -257,8 +355,10 @@ class Limiter:
                 if self._active is self._low and self._forced is None:
                     self._active = self._high
                     self._n_promotions += 1
+                    self._restart_window()
                     log.warning(
-                        f"tier promoted LOW -> HIGH (max_concurrent={self._high.max_concurrent})"
+                        f"tier promoted LOW -> HIGH (max_concurrent={self._high.max_concurrent}, "
+                        f"window={self._high.window_limit}/{self._high.window_seconds:.0f}s)"
                     )
             self._cond.notify_all()
 
@@ -276,8 +376,10 @@ class Limiter:
                 self._active = self._low
                 self._n_demotions += 1
                 self._last_demotion = now
+                self._restart_window()
                 log.warning(
-                    f"tier demoted HIGH -> LOW (max_concurrent={self._low.max_concurrent})"
+                    f"tier demoted HIGH -> LOW (max_concurrent={self._low.max_concurrent}, "
+                    f"window={self._low.window_limit}/{self._low.window_seconds:.0f}s)"
                 )
             self._cond.notify_all()
 
@@ -302,28 +404,25 @@ class Limiter:
             if self._active is not self._high:
                 self._active = self._high
                 self._n_promotions += 1
+                self._restart_window()
                 log.warning(
                     "tier boosted LOW -> HIGH (temporary; auto-demotes on "
-                    f"rate-limit; max_concurrent={self._high.max_concurrent})"
+                    f"rate-limit; max_concurrent={self._high.max_concurrent}, "
+                    f"window={self._high.window_limit}/{self._high.window_seconds:.0f}s)"
                 )
             self._cond.notify_all()
             return True
 
     async def update_tiers(self, low: Tier, high: Tier,
                            promotion_cooldown: float, forced: str | None,
-                           window_seconds: float | None = None,
-                           window_limit: int | None = None,
                            window_weights: dict[str, float] | None = None,
                            default_window_weight: float | None = None) -> None:
         async with self._cond:
+            old_active_name = self._active.name
             self._low = low
             self._high = high
             self._promotion_cooldown = promotion_cooldown
             self._forced = forced if forced in ("low", "high") else None
-            if window_seconds is not None:
-                self._window_seconds = float(window_seconds)
-            if window_limit is not None:
-                self._window_limit = int(window_limit)
             if window_weights is not None:
                 self._window_weights = dict(window_weights)
             if default_window_weight is not None:
@@ -334,6 +433,12 @@ class Limiter:
                 self._active = self._high
             else:
                 self._active = self._low if self._active.name == "low" else self._high
+            # A config change that forces a different tier restarts the window
+            # under the new tier's limit/duration, same as an auto switch. (When
+            # the tier is unchanged the new per-tier limit/duration are still
+            # picked up live from self._active on the next snapshot.)
+            if self._active.name != old_active_name:
+                self._restart_window()
             self._cond.notify_all()
 
     def snapshot(self) -> dict[str, Any]:
@@ -1035,8 +1140,20 @@ def load_config_file() -> dict[str, Any]:
 
 
 def make_tier(cfg: dict[str, Any], name: str) -> Tier:
+    """Build a Tier from config.
+
+    Each tier may carry its own `window_seconds` / `window_limit` (its rolling
+    request-quota budget). When omitted they fall back to the top-level
+    `rate_window_seconds` / `rate_window_limit` so older single-window configs
+    keep working.
+    """
     t = cfg["tiers"][name]
-    return Tier(name=name, max_concurrent=int(t["max_concurrent"]))
+    return Tier(
+        name=name,
+        max_concurrent=int(t["max_concurrent"]),
+        window_seconds=float(t.get("window_seconds", cfg.get("rate_window_seconds", 18000))),
+        window_limit=int(t.get("window_limit", cfg.get("rate_window_limit", 600))),
+    )
 
 
 def parse_window_weights(cfg: dict[str, Any]) -> tuple[dict[str, float], float]:
@@ -1076,8 +1193,6 @@ def init_from_config(cfg: dict[str, Any]) -> tuple[Limiter, Metrics, PersistentS
         initial_tier=cfg.get("initial_tier", "low"),
         promotion_cooldown=float(cfg["promotion_cooldown_seconds"]),
         forced=forced,
-        window_seconds=float(cfg.get("rate_window_seconds", 18000)),
-        window_limit=int(cfg.get("rate_window_limit", 600)),
         window_weights=window_weights,
         default_window_weight=default_window_weight,
     )
@@ -1111,8 +1226,6 @@ async def apply_config_change(new_cfg: dict[str, Any]) -> None:
         high=make_tier(new_cfg, "high"),
         promotion_cooldown=float(new_cfg["promotion_cooldown_seconds"]),
         forced=forced,
-        window_seconds=float(new_cfg.get("rate_window_seconds", 18000)),
-        window_limit=int(new_cfg.get("rate_window_limit", 600)),
         window_weights=window_weights,
         default_window_weight=default_window_weight,
     )
@@ -1146,11 +1259,55 @@ async def config_watch_loop() -> None:
         await asyncio.sleep(float(config.get("config_poll_seconds", 2.0)))
 
 
+def _window_persist_path() -> Path:
+    return Path(config.get("window_persist_path", "window.json")).resolve()
+
+
+def load_window_file() -> dict[str, Any] | None:
+    """Read the persisted rolling-window state (count + start), if any."""
+    p = _window_persist_path()
+    try:
+        if not p.exists():
+            return None
+        with open(p) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        log.warning(f"window: could not load {p}: {e!r}")
+        return None
+
+
+def save_window_file() -> None:
+    """Persist the current rolling-window state for the next restart.
+
+    Skips writing when no window is active (nothing worth restoring). Written
+    atomically via a temp file + os.replace.
+    """
+    state = limiter.window_state()
+    p = _window_persist_path()
+    if state.get("started_at") is None:
+        # No active window — clear any stale file so a restart starts fresh.
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(state, f, separators=(",", ":"))
+        os.replace(tmp, p)
+    except OSError as e:
+        log.warning(f"window: save to {p} failed: {e!r}")
+
+
 async def persist_loop() -> None:
-    """Flush aggregated stats to disk on the configured interval (when dirty)."""
+    """Flush aggregated stats + window state to disk on a fixed interval."""
     while True:
         try:
             await pstats.maybe_flush()
+            await asyncio.to_thread(save_window_file)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1166,6 +1323,7 @@ except FileNotFoundError:
     config_mtime = 0.0
 logging.getLogger().setLevel(str(config.get("log_level", "INFO")).upper())
 limiter, metrics, pstats = init_from_config(config)
+limiter.load_window_state(load_window_file())
 
 
 # ---------- HTTP app ----------
@@ -1196,6 +1354,7 @@ async def lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 pass
         await pstats.maybe_flush(force=True)
+        await asyncio.to_thread(save_window_file)
         await client.aclose()
 
 
@@ -1234,11 +1393,51 @@ DASHBOARD_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8" />
 <title>anthropic_proxy</title>
+<script>
+  /* Apply a saved theme before first paint to avoid a flash. "auto" (or no
+     value) leaves data-theme unset so the prefers-color-scheme media query
+     governs; "light"/"dark" pin it explicitly. */
+  (function () {
+    try {
+      var t = localStorage.getItem("theme");
+      if (t === "light" || t === "dark") {
+        document.documentElement.setAttribute("data-theme", t);
+      }
+    } catch (e) {}
+  })();
+</script>
 <style>
+  /* Dark theme (default). Light values live in the two blocks below: one for
+     the system "prefers light" setting (auto), one for the explicit
+     [data-theme="light"] toggle override. */
   :root {
     --bg: #0d1117; --panel: #161b22; --border: #30363d;
     --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
     --green: #3fb950; --yellow: #d29922; --red: #f85149;
+    --card-bg: rgba(0,0,0,0.25); --card-border: rgba(255,255,255,0.03);
+    --chart-bg: rgba(0,0,0,0.2); --bar-track: rgba(255,255,255,0.08);
+    --grid: #30363d; --accent-tint: rgba(88,166,255,0.15);
+  }
+  /* Auto: follow the OS setting when the user hasn't picked a theme (no
+     data-theme attribute). Reacts live to system light/dark changes. */
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme]) {
+      --bg: #ffffff; --panel: #f6f8fa; --border: #d0d7de;
+      --text: #1f2328; --muted: #656d76; --accent: #0969da;
+      --green: #1a7f37; --yellow: #9a6700; --red: #cf222e;
+      --card-bg: rgba(0,0,0,0.03); --card-border: rgba(0,0,0,0.06);
+      --chart-bg: rgba(0,0,0,0.03); --bar-track: rgba(0,0,0,0.08);
+      --grid: #d0d7de; --accent-tint: rgba(9,105,218,0.12);
+    }
+  }
+  /* Manual override: the toggle sets data-theme="light"|"dark" on <html>. */
+  :root[data-theme="light"] {
+    --bg: #ffffff; --panel: #f6f8fa; --border: #d0d7de;
+    --text: #1f2328; --muted: #656d76; --accent: #0969da;
+    --green: #1a7f37; --yellow: #9a6700; --red: #cf222e;
+    --card-bg: rgba(0,0,0,0.03); --card-border: rgba(0,0,0,0.06);
+    --chart-bg: rgba(0,0,0,0.03); --bar-track: rgba(0,0,0,0.08);
+    --grid: #d0d7de; --accent-tint: rgba(9,105,218,0.12);
   }
   * { box-sizing: border-box; }
   body {
@@ -1268,8 +1467,8 @@ DASHBOARD_HTML = """<!doctype html>
     gap: 10px;
   }
   .stat {
-    background: rgba(0,0,0,0.25); padding: 12px; border-radius: 6px;
-    border: 1px solid rgba(255,255,255,0.03);
+    background: var(--card-bg); padding: 12px; border-radius: 6px;
+    border: 1px solid var(--card-border);
   }
   .stat .label {
     color: var(--muted); font-size: 10px; text-transform: uppercase;
@@ -1296,8 +1495,8 @@ DASHBOARD_HTML = """<!doctype html>
   }
   .model-card {
     margin-bottom: 12px; padding: 12px;
-    background: rgba(0,0,0,0.25); border-radius: 6px;
-    border: 1px solid rgba(255,255,255,0.03);
+    background: var(--card-bg); border-radius: 6px;
+    border: 1px solid var(--card-border);
   }
   .model-card:last-child { margin-bottom: 0; }
   .model-head {
@@ -1315,13 +1514,14 @@ DASHBOARD_HTML = """<!doctype html>
   .empty { color: var(--muted); font-style: italic; text-align: center; padding: 12px; }
   .err { color: var(--red); }
   .ok { color: var(--green); }
-  #boost-btn {
+  #boost-btn, #theme-btn {
     background: var(--panel); color: var(--text);
     border: 1px solid var(--border); border-radius: 6px;
     padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
   }
   #boost-btn:hover:not(:disabled) { border-color: var(--green); color: var(--green); }
   #boost-btn:disabled { opacity: 0.5; cursor: default; }
+  #theme-btn:hover { border-color: var(--accent); color: var(--accent); }
   .panel-head {
     display: flex; justify-content: space-between; align-items: center;
     margin-bottom: 12px;
@@ -1338,7 +1538,7 @@ DASHBOARD_HTML = """<!doctype html>
   }
   .seg button:first-child { border-left: none; }
   .seg button:hover { color: var(--text); }
-  .seg button.active { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .seg button.active { background: var(--accent-tint); color: var(--accent); }
   .chart-block { margin-bottom: 14px; }
   .chart-block:last-child { margin-bottom: 0; }
   .chart-title {
@@ -1351,11 +1551,11 @@ DASHBOARD_HTML = """<!doctype html>
   .legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
   svg.chart {
     width: 100%; height: 150px; display: block;
-    background: rgba(0,0,0,0.2); border-radius: 6px;
+    background: var(--chart-bg); border-radius: 6px;
   }
   svg.chart text { fill: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; }
   .bar {
-    height: 6px; border-radius: 3px; background: rgba(255,255,255,0.08);
+    height: 6px; border-radius: 3px; background: var(--bar-track);
     overflow: hidden; margin-top: 8px;
   }
   .bar > i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
@@ -1371,6 +1571,7 @@ DASHBOARD_HTML = """<!doctype html>
       <div class="sub" id="upstream"></div>
     </div>
     <div style="display:flex; align-items:baseline; gap:12px;">
+      <button id="theme-btn" title="Theme: Auto follows your system; click to cycle Auto → Light → Dark">🖥 Auto</button>
       <button id="boost-btn" title="Temporarily switch to HIGH; auto-demotes to LOW on the first rate-limit">⚡ Boost HIGH</button>
       <div id="live">connecting…</div>
     </div>
@@ -1489,6 +1690,8 @@ function setLegend(id, items) {
 function drawChart(svgId, data, series, fmtVal) {
   const svg = document.getElementById(svgId);
   const pts = data.points || [];
+  const gridColor = getComputedStyle(document.documentElement)
+    .getPropertyValue("--grid").trim() || "#30363d";
   const W = svg.clientWidth || svg.parentElement.clientWidth || 800;
   const H = 150, padL = 46, padR = 8, padT = 8, padB = 16;
   const plotW = W - padL - padR, plotH = H - padT - padB;
@@ -1508,7 +1711,7 @@ function drawChart(svgId, data, series, fmtVal) {
   // gridlines + y labels (0, max/2, max)
   for (const frac of [0, 0.5, 1]) {
     const yy = padT + plotH - frac * plotH;
-    svgParts.push(`<line x1="${padL}" y1="${yy}" x2="${W - padR}" y2="${yy}" stroke="#30363d" stroke-width="1"/>`);
+    svgParts.push(`<line x1="${padL}" y1="${yy}" x2="${W - padR}" y2="${yy}" stroke="${gridColor}" stroke-width="1"/>`);
     svgParts.push(`<text x="${padL - 4}" y="${yy + 3}" text-anchor="end">${fmtVal(max * frac)}</text>`);
   }
   const gap = bw > 4 ? Math.min(2, bw * 0.2) : 0;
@@ -1760,6 +1963,33 @@ document.querySelectorAll("#series-controls button").forEach((b) => {
     drawSeries();
   });
 });
+// ---- Theme toggle: cycles Auto -> Light -> Dark, persisted in localStorage.
+// "auto" clears data-theme so the prefers-color-scheme media query governs.
+const THEMES = ["auto", "light", "dark"];
+const THEME_LABEL = { auto: "🖥 Auto", light: "☀ Light", dark: "🌙 Dark" };
+function currentTheme() {
+  const t = localStorage.getItem("theme");
+  return THEMES.includes(t) ? t : "auto";
+}
+function applyTheme(t) {
+  if (t === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", t);
+  const btn = document.getElementById("theme-btn");
+  if (btn) btn.textContent = THEME_LABEL[t];
+}
+document.getElementById("theme-btn").addEventListener("click", () => {
+  const next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];
+  localStorage.setItem("theme", next);
+  applyTheme(next);
+  drawSeries();   // repaint SVG gridlines with the new theme's --grid color
+});
+applyTheme(currentTheme());
+// Repaint charts when the OS theme flips while in Auto mode.
+if (window.matchMedia) {
+  window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+    if (currentTheme() === "auto") drawSeries();
+  });
+}
 window.addEventListener("resize", drawSeries);
 document.getElementById("boost-btn").addEventListener("click", async () => {
   const btn = document.getElementById("boost-btn");
@@ -1926,6 +2156,59 @@ async def boost_endpoint():
             status_code=409,
         )
     return limiter.snapshot()
+
+
+@app.post("/_proxy/window/count")
+async def set_window_count_endpoint(req: Request):
+    """Set the current rolling-window request count for the active session.
+
+    Body: {"count": <number >= 0>}. Anchors a fresh window at now if none is
+    active. Example:
+      curl -X POST localhost:8787/_proxy/window/count -d '{"count": 120}'
+    """
+    try:
+        body = await req.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
+    if not isinstance(body, dict) or "count" not in body:
+        return JSONResponse({"error": "body must be a JSON object with 'count'"}, status_code=400)
+    try:
+        count = float(body["count"])
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "'count' must be a number"}, status_code=400)
+    if count < 0:
+        return JSONResponse({"error": "'count' must be >= 0"}, status_code=400)
+    snap = limiter.set_window_count(count)
+    await asyncio.to_thread(save_window_file)
+    return {"window": snap}
+
+
+@app.post("/_proxy/window/start")
+async def set_window_start_endpoint(req: Request):
+    """Set the current rolling-window start time (unix seconds).
+
+    Body: {"started_at": <unix seconds>} to anchor the window, or
+    {"started_at": null} to clear it (the next request re-anchors). Example:
+      curl -X POST localhost:8787/_proxy/window/start -d '{"started_at": 1733250000}'
+    """
+    try:
+        body = await req.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
+    if not isinstance(body, dict) or "started_at" not in body:
+        return JSONResponse({"error": "body must be a JSON object with 'started_at'"}, status_code=400)
+    started_at = body["started_at"]
+    if started_at is not None:
+        try:
+            started_at = float(started_at)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "'started_at' must be a unix timestamp (seconds) or null"},
+                status_code=400,
+            )
+    snap = limiter.set_window_start(started_at)
+    await asyncio.to_thread(save_window_file)
+    return {"window": snap}
 
 
 # ---------- Proxy handler ----------

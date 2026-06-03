@@ -17,9 +17,14 @@ Anthropic, OpenAI Chat Completions, and OpenAI Responses `usage` shapes).
 - **Two-tier auto-detection.** Discovers whether upstream is currently allowing
   4 or 1000 concurrent requests by sending a speculative "probe" request when
   the lower cap is saturated.
+- **Per-tier quota windows.** Each tier carries its own rolling request-quota
+  window (LOW `600`/5h, HIGH `99999`/1h by default); the indicator restarts with
+  the right limit + duration whenever the tier switches. Window state is
+  persisted across restarts and can be set by hand over HTTP.
 - **Auto-retry on `429` / `503` / `529`** with `Retry-After` honored.
 - **Hot-reloaded YAML config.** Edit `config.yaml`, save, ~2s later it's live.
-- **Web dashboard** with per-model latency, throughput, tokens, and cost.
+- **Web dashboard** with per-model latency, throughput, tokens, and cost, plus a
+  **light / dark / auto theme** toggle (auto follows your OS).
 - **Persisted stats.** Weekly / monthly / lifetime totals and request/token
   graphs survive restarts (written to disk on an interval, not per request).
 - **Statusline endpoint** for tmux / Claude Code status bars.
@@ -32,7 +37,12 @@ config.yaml       all settings; hot-reloaded
 statusline.sh     wrapper for Claude Code / tmux status bars
 requirements.txt  for pip users
 stats.json        persisted long-horizon stats (auto-created; git-ignored)
+window.json       persisted current quota-window state (auto-created; git-ignored)
 ```
+
+> The whole app currently lives in `proxy.py`. A planned split into a package
+> (limiter / metrics / persistence / dashboard / server) is sketched in
+> [`CLAUDE.md`](CLAUDE.md).
 
 ## Run it
 
@@ -93,32 +103,64 @@ upstream_base_url: "https://your-custom-service.example.com"
 
 ## Two-tier model
 
-The proxy assumes upstream allows one of two concurrency caps:
+The proxy assumes upstream allows one of two concurrency caps. Each tier also
+carries its own rolling **request-quota window** (see below):
 
-| Tier | Max concurrent |
-|------|---:|
-| `low`  | 4    |
-| `high` | 1000 |
+| Tier | Max concurrent | Quota window (default) |
+|------|---:|---|
+| `low`  | 4    | `600` requests / 5h |
+| `high` | 1000 | `99999` requests / 1h |
 
-Each tier is purely a concurrency cap — there is no per-window request cap or
-preemptive pacing. If upstream enforces a rolling request quota, you'll hit it
-as a `429`, and the retry/backoff (below) is what makes callers wait.
+The concurrency cap is enforced (requests queue past it). The quota window is
+**tracked, not enforced** — if upstream rejects you because a quota is spent,
+you'll see a `429`, and the retry/backoff (below) is what makes callers wait.
 
 ### Quota window indicator
 
-The low tier typically also has a rolling **request quota** (e.g. 600 requests
-per 5h). The proxy doesn't enforce that — but it tracks it so the dashboard can
-show how far you are into the current window:
+Each tier has a rolling **request quota** (LOW e.g. 600/5h, HIGH e.g.
+99999/1h). The proxy doesn't enforce it, but tracks it so the dashboard can show
+how far you are into the current window:
 
 - The window is **anchored at the first request** sent after the previous one
-  expired ("the 5h starts when the first request goes out"). If you've been idle
-  long enough that the last window elapsed, the next request opens a fresh one.
+  expired ("the window starts when the first request goes out"). If you've been
+  idle long enough that the last window elapsed, the next request opens a fresh
+  one.
+- It's **per tier**: whenever the active tier switches (LOW ⇄ HIGH, by
+  auto-detect, boost, or a forced change) the counter **restarts** under the new
+  tier's limit and duration. So promoting to HIGH gives you a fresh `0 / 99999`
+  over 1h, and dropping back to LOW resets to `0 / 600` over 5h.
 - The **Current State** panel shows `count / limit` requests used, time elapsed
   and time left, and a progress bar; the bar turns yellow/red as you approach
   the limit.
-- Tune it with `rate_window_seconds` (default `18000` = 5h) and
-  `rate_window_limit` (default `600`). It's tracked, **not enforced** — the
-  `429` + retry budget below are what actually pace you.
+- Configure each tier's window with `tiers.<tier>.window_seconds` /
+  `window_limit`. A tier that omits them falls back to the top-level
+  `rate_window_seconds` (default `18000` = 5h) / `rate_window_limit` (`600`).
+
+**Persisted across restarts.** The current count + start time are written to
+`window_persist_path` (default `window.json`) every ~5s and on shutdown, then
+restored on boot — **unless** the saved window has already elapsed, in which case
+it's discarded and the next request opens a fresh one.
+
+**Set it by hand.** Useful after a restart mid-window, or to sync the indicator
+with what upstream actually thinks you've used:
+
+```sh
+# Set the current count for the active window
+curl -X POST http://127.0.0.1:8787/_proxy/window/count \
+     -H 'content-type: application/json' -d '{"count": 120}'
+
+# Set (or clear with null) the window start time, as unix seconds
+curl -X POST http://127.0.0.1:8787/_proxy/window/start \
+     -H 'content-type: application/json' -d '{"started_at": 1733250000}'
+```
+
+### Per-model window weighting
+
+A single request can cost more than one unit toward the quota window (e.g. an
+Opus call costing 4× a Haiku call). Set `model_window_weights` (matched by exact
+model name, then substring) and `default_window_weight` in `config.yaml`. This
+affects **only** the window indicator — per-request metrics and per-model stats
+still count every request exactly once.
 
 ### Surviving a full window (retry budget)
 
@@ -175,7 +217,10 @@ or set `force_tier: high` in `config.yaml` (picked up within ~2s).
 | `/_proxy/status`         | GET  | Limiter snapshot only |
 | `/_proxy/config`         | GET  | Currently-loaded config |
 | `/_proxy/statusline`     | GET  | One-line text status |
-| `/_proxy/force_tier`     | POST | `{"tier": "low" \| "high" \| null}` |
+| `/_proxy/force_tier`     | POST | Pin a tier: `{"tier": "low" \| "high" \| null}` |
+| `/_proxy/boost`          | POST | Jump to HIGH temporarily; auto-demotes on the next rate-limit |
+| `/_proxy/window/count`   | POST | Set the active quota window's count: `{"count": N}` |
+| `/_proxy/window/start`   | POST | Set/clear the window start time: `{"started_at": <unix s> \| null}` |
 | any other path           | any  | Forwarded to `upstream_base_url` |
 
 ## Dashboard
@@ -199,6 +244,12 @@ What's shown:
   24h and 7d are bucketed hourly; 30d and lifetime are bucketed daily.
 - **Per Model.** Two tables (latency + tokens) for every model that's been
   seen — keyed off the `model` field in request bodies.
+
+Header controls:
+- **Theme** button cycles **Auto → Light → Dark** (persisted in your browser).
+  *Auto* follows your OS `prefers-color-scheme` and flips live when the OS does.
+- **⚡ Boost HIGH** temporarily promotes to HIGH (`POST /_proxy/boost`); it
+  auto-demotes on the first rate-limit. Disabled while a `force_tier` is pinned.
 
 ## Statusline integration
 
@@ -335,6 +386,10 @@ curl -s "http://127.0.0.1:8787/_proxy/series?window=7d" | jq '.points | length'
 The file is plain JSON and git-ignored. Delete it to reset all long-horizon
 history; the proxy recreates it on the next flush.
 
+The current **quota-window** state (count + start) is persisted separately to
+`window.json` on the same interval, and restored on boot unless it has already
+elapsed — see [Quota window indicator](#quota-window-indicator).
+
 ## Config reference
 
 All of `config.yaml` is hot-reloaded except `upstream_base_url`, `listen_host`,
@@ -346,13 +401,17 @@ and `listen_port` — those require a restart.
 | `listen_host` / `listen_port` | `127.0.0.1` / `8787` | Local socket. |
 | `initial_tier` | `low` | `low` or `high`. |
 | `force_tier` | `null` | `null` = auto, `"low"` / `"high"` = pin. |
-| `tiers.low / tiers.high` | `4` / `1000` | `max_concurrent` only — the concurrency cap for each tier. |
+| `tiers.<tier>.max_concurrent` | `4` / `1000` | Concurrency cap for each tier (`low` / `high`). |
+| `tiers.<tier>.window_seconds` | `18000` / `3600` | Each tier's quota-window length (LOW 5h, HIGH 1h). Falls back to `rate_window_seconds`. |
+| `tiers.<tier>.window_limit` | `600` / `99999` | Requests-per-window shown in the indicator for that tier. Falls back to `rate_window_limit`. |
 | `promotion_cooldown_seconds` | `300` | Min seconds between failed probe / demotion and next probe. |
 | `retry_max_attempts` | `12` | Max **connection-error** retries per request. |
 | `retry_base_delay` / `retry_max_delay` | `1.0` / `60.0` | Exponential backoff bounds. |
 | `retry_max_elapsed_seconds` | `18900` | Total time a **rate-limited** request keeps retrying (outlasts the 5h window). |
-| `rate_window_seconds` | `18000` | Quota-window length for the dashboard indicator (tracked, not enforced). |
-| `rate_window_limit` | `600` | Requests-per-window shown in the indicator. |
+| `rate_window_seconds` | `18000` | **Fallback** quota-window length for tiers that don't set their own. |
+| `rate_window_limit` | `600` | **Fallback** requests-per-window for tiers that don't set their own. |
+| `model_window_weights` / `default_window_weight` | `{}` / `1` | Per-model units charged to the window indicator (only). |
+| `window_persist_path` | `window.json` | File for the persisted current quota-window state. |
 | `upstream_timeout` | `600` | Per-request timeout (s). |
 | `log_level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. |
 | `config_poll_seconds` | `2.0` | How often `config.yaml` is checked. |
@@ -380,7 +439,8 @@ Override the config file path with `CONFIG_PATH=/some/path/config.yaml`.
   `(no-body)`.
 - **Persistence.** The rolling-window metrics (1m … 24h, with percentiles) are
   in-memory and reset on restart. Weekly / monthly / lifetime totals and the
-  graph history are persisted to `stats.json` and survive restarts — see
+  graph history are persisted to `stats.json`; the current quota-window state is
+  persisted to `window.json`. Both survive restarts — see
   [Persisted statistics](#persisted-statistics).
 
 ## Manual control
@@ -402,4 +462,13 @@ curl -X POST http://127.0.0.1:8787/_proxy/force_tier \
 # Back to auto
 curl -X POST http://127.0.0.1:8787/_proxy/force_tier \
      -H 'content-type: application/json' -d '{"tier":null}'
+
+# Temporarily jump to HIGH (auto-demotes on the next rate-limit)
+curl -X POST http://127.0.0.1:8787/_proxy/boost
+
+# Sync the quota-window indicator with what upstream has actually used
+curl -X POST http://127.0.0.1:8787/_proxy/window/count \
+     -H 'content-type: application/json' -d '{"count":120}'
+curl -X POST http://127.0.0.1:8787/_proxy/window/start \
+     -H 'content-type: application/json' -d '{"started_at":1733250000}'
 ```

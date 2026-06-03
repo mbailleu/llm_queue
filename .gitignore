@@ -5,3 +5,7 @@ __pycache__/
 # Persisted runtime statistics
 stats.json
 stats.json.tmp
+
+# Persisted rolling-window state
+window.json
+window.json.tmp

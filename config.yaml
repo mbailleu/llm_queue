@@ -21,16 +21,27 @@ initial_tier: "low"   # "low" | "high"
 # pin a specific tier and disable auto-tier switching.
 force_tier: null
 
-# The two tiers — each is just a max concurrency cap. There is no preemptive
-# per-window pacing: requests are admitted as fast as the cap allows, and when
-# upstream rate-limits (429/503/529) the proxy retries with backoff so callers
-# wait then. The proxy auto-detects which cap upstream currently allows by
-# probing HIGH when LOW is saturated (see promotion_cooldown_seconds).
+# The two tiers — each has a max concurrency cap plus its own rolling
+# request-quota window (window_limit requests per window_seconds). There is no
+# preemptive per-window pacing: requests are admitted as fast as the cap allows,
+# and when upstream rate-limits (429/503/529) the proxy retries with backoff so
+# callers wait then. The proxy auto-detects which cap upstream currently allows
+# by probing HIGH when LOW is saturated (see promotion_cooldown_seconds).
+#
+# Each tier's window drives the dashboard "X / N this window" indicator while
+# that tier is active, and the counter RESTARTS (fresh count + timer, under the
+# new tier's limit/duration) every time the active tier switches LOW<->HIGH.
+# window_seconds/window_limit are optional per tier; when omitted they fall back
+# to the top-level rate_window_seconds / rate_window_limit below.
 tiers:
   low:
     max_concurrent: 4
+    window_seconds: 18000     # 5h
+    window_limit: 600
   high:
     max_concurrent: 1000
+    window_seconds: 3600      # 1h
+    window_limit: 99999       # per-hour ceiling once promoted to HIGH
 
 # After a HIGH->LOW demotion (or a failed probe), wait this many seconds before
 # trying to probe HIGH again.
@@ -50,13 +61,15 @@ retry_max_delay: 60.0          # cap per backoff sleep (exponential branch)
 retry_max_elapsed_seconds: 18900   # 5h15m — outlasts the 5h window below
 upstream_timeout: 600          # per-request timeout (seconds)
 
-# Rolling request-quota window — the upstream "N requests per W seconds" budget.
-# Anchored at the first request after the previous window expired ("the 5h
-# starts when the first request is sent"). This is TRACKED for the dashboard
-# "X / N this window" indicator and time bar; it is NOT enforced here — the
-# upstream 429 + the retry/backoff above are what actually pace you.
+# Fallback rolling request-quota window — used only by tiers that don't set
+# their own window_seconds/window_limit above (so older single-window configs
+# keep working). The upstream "N requests per W seconds" budget is anchored at
+# the first request after the previous window expired ("the window starts when
+# the first request is sent"). TRACKED for the dashboard "X / N this window"
+# indicator and time bar; NOT enforced here — the upstream 429 + the
+# retry/backoff above are what actually pace you.
 rate_window_seconds: 18000     # 5h
-rate_window_limit: 600         # requests per window (low tier)
+rate_window_limit: 600         # requests per window (fallback default)
 
 # Per-model weighting for the window count. A request for a listed model counts
 # as `factor` requests toward the "X / N this window" indicator above — e.g. an
@@ -87,6 +100,14 @@ stats_persist_path: "stats.json"   # file to read/write; relative to CWD
 stats_flush_seconds: 60.0          # min seconds between disk writes (when dirty)
 stats_retention_days: 120          # how long hourly buckets (the graph history)
                                    # are kept; lifetime totals are kept forever
+
+# Current rolling-window state (request count + window start) is persisted here
+# every ~5s and on shutdown, then restored on boot — UNLESS the saved window has
+# already elapsed (now - start >= its window_seconds), in which case it's
+# discarded and the window starts fresh. Set/override at runtime with:
+#   curl -X POST localhost:8787/_proxy/window/count -d '{"count": 120}'
+#   curl -X POST localhost:8787/_proxy/window/start -d '{"started_at": 1733250000}'
+window_persist_path: "window.json"
 
 # Optional per-model pricing for cost calculation (per 1,000,000 tokens, in
 # whatever unit your provider bills in — dollars, credits, etc.).
