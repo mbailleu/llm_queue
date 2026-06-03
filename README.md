@@ -20,6 +20,8 @@ Anthropic, OpenAI Chat Completions, and OpenAI Responses `usage` shapes).
 - **Auto-retry on `429` / `503` / `529`** with `Retry-After` honored.
 - **Hot-reloaded YAML config.** Edit `config.yaml`, save, ~2s later it's live.
 - **Web dashboard** with per-model latency, throughput, tokens, and cost.
+- **Persisted stats.** Weekly / monthly / lifetime totals and request/token
+  graphs survive restarts (written to disk on an interval, not per request).
 - **Statusline endpoint** for tmux / Claude Code status bars.
 
 ## Layout
@@ -29,6 +31,7 @@ proxy.py          single-file FastAPI app (PEP 723 inline deps)
 config.yaml       all settings; hot-reloaded
 statusline.sh     wrapper for Claude Code / tmux status bars
 requirements.txt  for pip users
+stats.json        persisted long-horizon stats (auto-created; git-ignored)
 ```
 
 ## Run it
@@ -101,6 +104,45 @@ Each tier is purely a concurrency cap — there is no per-window request cap or
 preemptive pacing. If upstream enforces a rolling request quota, you'll hit it
 as a `429`, and the retry/backoff (below) is what makes callers wait.
 
+### Quota window indicator
+
+The low tier typically also has a rolling **request quota** (e.g. 600 requests
+per 5h). The proxy doesn't enforce that — but it tracks it so the dashboard can
+show how far you are into the current window:
+
+- The window is **anchored at the first request** sent after the previous one
+  expired ("the 5h starts when the first request goes out"). If you've been idle
+  long enough that the last window elapsed, the next request opens a fresh one.
+- The **Current State** panel shows `count / limit` requests used, time elapsed
+  and time left, and a progress bar; the bar turns yellow/red as you approach
+  the limit.
+- Tune it with `rate_window_seconds` (default `18000` = 5h) and
+  `rate_window_limit` (default `600`). It's tracked, **not enforced** — the
+  `429` + retry budget below are what actually pace you.
+
+### Surviving a full window (retry budget)
+
+When upstream rate-limits you because the quota is spent, you usually want the
+queued request to **wait out the window and run once the quota resets**, not get
+dropped after a few minutes. Retry handling is therefore split:
+
+- **Connection errors** (upstream unreachable) give up after
+  `retry_max_attempts` — a down upstream won't be fixed by waiting.
+- **Rate-limit responses** (`429` / `503` / `529`) retry against a wall-clock
+  budget, `retry_max_elapsed_seconds` (default `18900` = 5h15m, i.e. a bit more
+  than the 5h window). A server `Retry-After` is honored in full (up to the
+  remaining budget), so a long reset is slept out in one wait instead of
+  hammering upstream every `retry_max_delay`.
+
+While a request is backing off it does **not** hold a concurrency slot, so a
+pile of waiting requests won't block fresh ones.
+
+> **Client timeout caveat.** The proxy can hold a request for hours, but the
+> *client* must keep its connection open that long too. Claude Code and most
+> SDKs apply their own request timeout, so in practice a request survives until
+> whichever side gives up first. Raise the budget all you like; it can't outlast
+> the client.
+
 ### How auto-detection works
 
 - Start in `initial_tier` (default `low`).
@@ -128,7 +170,8 @@ or set `force_tier: high` in `config.yaml` (picked up within ~2s).
 | Path | Method | What |
 |---|---|---|
 | `/_proxy/`              | GET  | Web dashboard |
-| `/_proxy/metrics`        | GET  | All metrics as JSON |
+| `/_proxy/metrics`        | GET  | All metrics as JSON (incl. `persistent` weekly/monthly/lifetime) |
+| `/_proxy/series`         | GET  | Bucketed time series for graphs (`?window=24h\|7d\|30d\|lifetime`) |
 | `/_proxy/status`         | GET  | Limiter snapshot only |
 | `/_proxy/config`         | GET  | Currently-loaded config |
 | `/_proxy/statusline`     | GET  | One-line text status |
@@ -140,13 +183,20 @@ or set `force_tier: high` in `config.yaml` (picked up within ~2s).
 Open <http://127.0.0.1:8787/_proxy/>. Refreshes every 2 seconds.
 
 What's shown:
-- **Current State.** Active tier, in-flight / cap, queued count, and lifetime
-  counters (rate-limited, promotions, demotions, probes).
+- **Current State.** Active tier, in-flight / cap, queued count, the rolling
+  **quota window** (`X / N` requests used, time elapsed / left, with a progress
+  bar), and lifetime counters (rate-limited, promotions, demotions, probes).
 - **Throughput.** Per-window request count, average latency, error badge,
   and total cost (if priced). Windows: 1m / 10m / 1h / 5h / 24h.
 - **Overall Latency.** Count, OK, errors, avg, p50, p95 per window.
 - **Overall Tokens & Cost.** Input, output, cache-write, cache-read,
   cost per window.
+- **Totals (persisted).** 24h / weekly / monthly / lifetime request counts,
+  tokens in/out, average latency, and cost — read from the on-disk store, so
+  they survive restarts (see [Persisted statistics](#persisted-statistics)).
+- **Graphs.** Stacked-bar time series of requests (ok vs. errors) and tokens
+  (input / cache / output), with a `24h / 7d / 30d / lifetime` window switch.
+  24h and 7d are bucketed hourly; 30d and lifetime are bucketed daily.
 - **Per Model.** Two tables (latency + tokens) for every model that's been
   seen — keyed off the `model` field in request bodies.
 
@@ -254,6 +304,37 @@ Models not in `model_pricing` still show token counts; cost just renders as
 `—`. Hot-reload applies new prices to all future requests (already-recorded
 completions keep the cost they were tagged with at the time).
 
+## Persisted statistics
+
+The rolling-window metrics (1m … 24h, with percentiles) live in memory only.
+On top of that, the proxy keeps a **long-horizon aggregated store** so weekly,
+monthly, and lifetime totals — plus the dashboard graphs — survive restarts.
+
+- Each completion is folded into an **hourly per-model counter bucket** (count,
+  success/errors, the four token columns, and summed duration for an average),
+  plus a **running lifetime total** that's never pruned.
+- The store is written to `stats_persist_path` (default `stats.json`) on an
+  interval (`stats_flush_seconds`, default 60s) — **not on every request** —
+  and atomically (`stats.json.tmp` → rename). It's also flushed on shutdown and
+  re-read on startup.
+- Hourly buckets older than `stats_retention_days` (default 120) are dropped;
+  that bounds the graph history and file size. Lifetime totals are unaffected.
+- **Cost is not stored** — it's computed at read time from the current
+  `model_pricing`, so re-pricing applies retroactively to historical totals.
+  Percentiles aren't kept long-term (they can't be merged across buckets); only
+  averages are.
+
+Read it via `/_proxy/metrics` (the `persistent` object, keyed `24h` / `7d` /
+`30d` / `lifetime`) or graph it via `/_proxy/series?window=…`.
+
+```sh
+curl -s http://127.0.0.1:8787/_proxy/metrics | jq .persistent.lifetime.overall
+curl -s "http://127.0.0.1:8787/_proxy/series?window=7d" | jq '.points | length'
+```
+
+The file is plain JSON and git-ignored. Delete it to reset all long-horizon
+history; the proxy recreates it on the next flush.
+
 ## Config reference
 
 All of `config.yaml` is hot-reloaded except `upstream_base_url`, `listen_host`,
@@ -267,13 +348,19 @@ and `listen_port` — those require a restart.
 | `force_tier` | `null` | `null` = auto, `"low"` / `"high"` = pin. |
 | `tiers.low / tiers.high` | `4` / `1000` | `max_concurrent` only — the concurrency cap for each tier. |
 | `promotion_cooldown_seconds` | `300` | Min seconds between failed probe / demotion and next probe. |
-| `retry_max_attempts` | `12` | Per request. |
+| `retry_max_attempts` | `12` | Max **connection-error** retries per request. |
 | `retry_base_delay` / `retry_max_delay` | `1.0` / `60.0` | Exponential backoff bounds. |
+| `retry_max_elapsed_seconds` | `18900` | Total time a **rate-limited** request keeps retrying (outlasts the 5h window). |
+| `rate_window_seconds` | `18000` | Quota-window length for the dashboard indicator (tracked, not enforced). |
+| `rate_window_limit` | `600` | Requests-per-window shown in the indicator. |
 | `upstream_timeout` | `600` | Per-request timeout (s). |
 | `log_level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. |
 | `config_poll_seconds` | `2.0` | How often `config.yaml` is checked. |
 | `metrics_window_seconds` | `86400` | Rolling-window cap for the completions deque. |
 | `model_pricing` | `{}` | Per-million-token rates. |
+| `stats_persist_path` | `stats.json` | File for persisted weekly/monthly/lifetime stats + graph history. |
+| `stats_flush_seconds` | `60.0` | Min seconds between disk writes (only when there's new data). |
+| `stats_retention_days` | `120` | How long hourly graph buckets are kept; lifetime totals are kept forever. |
 
 Override the config file path with `CONFIG_PATH=/some/path/config.yaml`.
 
@@ -291,8 +378,10 @@ Override the config file path with `CONFIG_PATH=/some/path/config.yaml`.
 - **Model identification.** Pulled from the JSON request body's `model`
   field. Requests with no parseable body get bucketed as `(unknown)` /
   `(no-body)`.
-- **Persistence.** Metrics live in memory only — a restart wipes the 24h
-  history.
+- **Persistence.** The rolling-window metrics (1m … 24h, with percentiles) are
+  in-memory and reset on restart. Weekly / monthly / lifetime totals and the
+  graph history are persisted to `stats.json` and survive restarts — see
+  [Persisted statistics](#persisted-statistics).
 
 ## Manual control
 
@@ -302,6 +391,9 @@ curl http://127.0.0.1:8787/_proxy/status | jq
 
 # All metrics including per-model
 curl http://127.0.0.1:8787/_proxy/metrics | jq
+
+# Persisted weekly / monthly / lifetime totals
+curl http://127.0.0.1:8787/_proxy/metrics | jq '.persistent | {weekly: ."7d".overall, monthly: ."30d".overall, lifetime: .lifetime.overall}'
 
 # Pin tier
 curl -X POST http://127.0.0.1:8787/_proxy/force_tier \

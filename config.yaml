@@ -37,15 +37,40 @@ tiers:
 promotion_cooldown_seconds: 300
 
 # Retry behavior when upstream returns 429/503/529 or connection errors.
+# - retry_max_attempts bounds CONNECTION-error retries (a down upstream won't be
+#   fixed by waiting), using exponential backoff.
+# - retry_max_elapsed_seconds bounds RATE-LIMIT (429/503/529) retries by total
+#   wall-clock time. Set a bit above rate_window_seconds so a queued request can
+#   outlast a full quota window and still run once the quota resets, instead of
+#   being purged after a few minutes. NOTE: your client must also keep its
+#   connection open this long (Claude Code's own timeout still applies).
 retry_max_attempts: 12
-retry_base_delay: 1.0     # seconds; doubled each attempt
-retry_max_delay: 60.0     # cap per backoff sleep
-upstream_timeout: 600     # per-request timeout (seconds)
+retry_base_delay: 1.0          # seconds; doubled each attempt
+retry_max_delay: 60.0          # cap per backoff sleep (exponential branch)
+retry_max_elapsed_seconds: 18900   # 5h15m — outlasts the 5h window below
+upstream_timeout: 600          # per-request timeout (seconds)
+
+# Rolling request-quota window — the upstream "N requests per W seconds" budget.
+# Anchored at the first request after the previous window expired ("the 5h
+# starts when the first request is sent"). This is TRACKED for the dashboard
+# "X / N this window" indicator and time bar; it is NOT enforced here — the
+# upstream 429 + the retry/backoff above are what actually pace you.
+rate_window_seconds: 18000     # 5h
+rate_window_limit: 600         # requests per window (low tier)
 
 log_level: "INFO"         # DEBUG | INFO | WARNING | ERROR
 
 # How often the proxy checks this config file for changes.
 config_poll_seconds: 2.0
+
+# Long-horizon statistics, persisted to disk so weekly/monthly/lifetime totals
+# and the dashboard graphs survive restarts. Completions are folded into hourly
+# per-model buckets (plus running lifetime totals) and written out on an
+# interval — not on every request.
+stats_persist_path: "stats.json"   # file to read/write; relative to CWD
+stats_flush_seconds: 60.0          # min seconds between disk writes (when dirty)
+stats_retention_days: 120          # how long hourly buckets (the graph history)
+                                   # are kept; lifetime totals are kept forever
 
 # Optional per-model pricing for cost calculation (per 1,000,000 tokens, in
 # whatever unit your provider bills in — dollars, credits, etc.).

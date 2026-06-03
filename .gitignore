@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Persisted runtime statistics
+stats.json
+stats.json.tmp
