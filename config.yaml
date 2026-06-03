@@ -9,9 +9,34 @@
 # (/v1/chat/completions, /v1/responses) — both flow through the same queue.
 upstream_base_url: "https://api.anthropic.com"
 
-# Local listening socket for Claude Code to connect to.
+# Local listening socket for the HUMAN lane (Claude Code / interactive use).
+# This lane is never throttled and has concurrency priority over automation.
 listen_host: "127.0.0.1"
 listen_port: 8787
+
+# Second listening socket for the AUTOMATION lane (scripts / tight loops). Point
+# batch jobs here; they are paced so they spend only the LEFTOVER request budget
+# without starving the human lane. Both ports share one upstream, queue, tier
+# auto-detection, and quota window — they differ only in admission policy.
+# Set to null to disable the second lane entirely.
+throttle_listen_port: 8788
+
+# --- Automation-lane pacing ---
+# The pacer admits automation at rate = usable / time_left, where
+#   usable = window_limit - used - human_demand_safety * human_rate * time_left
+#            - human_quota_floor
+# so it holds back what humans are *statistically predicted* to still need. As
+# the window nears its end that prediction term shrinks to ~0, letting
+# automation drain up to 100% of what's left. The rate is also capped by the
+# physical pipe (free slots / measured avg request time), and concurrency stays
+# bounded by max_concurrent (with human priority).
+auto_pacing_enabled: true
+human_demand_safety: 1.5            # >1 leaves more headroom for humans (slower auto)
+human_demand_horizon_seconds: 3600  # window over which the human request rate is measured
+human_quota_floor: 0                # hard floor of requests always kept free for humans (0 = purely statistical)
+auto_concurrency_reserve: 0         # slots reserved for humans (auto capped at max_concurrent - this; 0 = rely on priority)
+auto_assumed_request_seconds: 30.0  # avg request time assumed before any latency is measured
+auto_poll_seconds: 1.0              # how often a parked/over-pace auto request re-checks
 
 # Which tier to assume at startup. The proxy will auto-switch from here based
 # on what upstream actually accepts.

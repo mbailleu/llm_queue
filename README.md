@@ -61,7 +61,9 @@ pip install -r requirements.txt
 python proxy.py
 ```
 
-It listens on `http://127.0.0.1:8787` by default. Logs go to stderr.
+It listens on **two ports** by default: `8787` for the human lane and `8788`
+for the throttled automation lane (see [Two lanes](#two-lanes-human-vs-automation)).
+Logs go to stderr.
 
 ## Point a client at it
 
@@ -93,6 +95,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
 proxy forwards the `Authorization` header upstream unchanged.) Any other
 OpenAI-SDK client works the same way — set `OPENAI_BASE_URL=http://127.0.0.1:8787/v1`.
 
+For a **script or tight loop**, point it at the automation port (`8788`)
+instead, so it gets paced and can't exhaust the request budget the human needs:
+
+```sh
+ANTHROPIC_BASE_URL=http://127.0.0.1:8788 ./my-batch-job.sh
+```
+
 In `config.yaml`, set `upstream_base_url` to whatever your custom service is.
 The one upstream can serve both API shapes; the proxy doesn't care which path
 the client hits:
@@ -100,6 +109,51 @@ the client hits:
 ```yaml
 upstream_base_url: "https://your-custom-service.example.com"
 ```
+
+## Two lanes (human vs automation)
+
+The proxy listens on two ports that share **one** upstream, queue, tier
+auto-detector, and quota window — they differ only in *admission policy*:
+
+| Lane | Port (default) | Policy |
+|---|---|---|
+| **human** | `8787` (`listen_port`) | Never throttled. Concurrency **priority** — a human is admitted ahead of any queued automation, and under saturation triggers a HIGH probe rather than waiting. |
+| **automation** | `8788` (`throttle_listen_port`) | **Paced** so it spends only the *leftover* request budget, ramping toward 100% as the window ends but never (statistically) starving the human. |
+
+Point interactive tools (Claude Code, opencode with a person driving) at `8787`,
+and scripts / tight loops at `8788`. Set `throttle_listen_port: null` to disable
+the second lane entirely (single-port mode).
+
+### How the automation lane is paced
+
+Every time an automation request arrives, the pacer admits it at a target rate:
+
+```
+usable = window_limit − used − human_demand_safety · human_rate · time_left − human_quota_floor
+rate   = usable / time_left                       # spread the leftover evenly
+rate   = min(rate, free_slots / avg_request_time) # never outrun the pipe
+```
+
+- **`used`** is the whole window's count (human + automation), so the lanes
+  compete for one shared budget.
+- **`human_rate`** is the observed human request rate, *averaged over
+  `human_demand_horizon_seconds`* so a short human burst isn't extrapolated into
+  a giant reservation. `human_demand_safety` (default `1.5`) padding decides how
+  much predicted human demand to hold back.
+- As the window nears its end, `time_left → 0`, the predicted-human term
+  vanishes, and automation is free to **drain up to 100%** of what's left.
+  Early on it holds back exactly what humans are statistically expected to need.
+- If humans have already spent the window down to that prediction, `usable ≤ 0`
+  and automation **parks** until the window advances or resets.
+- `avg_request_time` (the tracked EWMA latency) and the tier's concurrency cap
+  set the physical ceiling, so the pacer never schedules faster than requests
+  can actually drain. In the low tier that's `max_concurrent` (4) slots.
+
+Real-time spikes are covered separately: automation never occupies a reserved
+slot (`auto_concurrency_reserve`, default 0) and always yields freed slots to
+waiting humans, so even a sudden human burst isn't blocked while the slower
+quota prediction catches up. All knobs are in
+[the config reference](#config-reference) and hot-reload.
 
 ## Two-tier model
 
@@ -228,9 +282,11 @@ or set `force_tier: high` in `config.yaml` (picked up within ~2s).
 Open <http://127.0.0.1:8787/_proxy/>. Refreshes every 2 seconds.
 
 What's shown:
-- **Current State.** Active tier, in-flight / cap, queued count, the rolling
-  **quota window** (`X / N` requests used, time elapsed / left, with a progress
-  bar), and lifetime counters (rate-limited, promotions, demotions, probes).
+- **Current State.** Active tier, in-flight / cap, queued count, a **Lanes** card
+  (human / automation in-flight, paced-auto backlog, observed human rate), the
+  rolling **quota window** (`X / N` requests used, time elapsed / left, with a
+  progress bar), and lifetime counters (rate-limited, promotions, demotions,
+  probes).
 - **Throughput.** Per-window request count, average latency, error badge,
   and total cost (if priced). Windows: 1m / 10m / 1h / 5h / 24h.
 - **Overall Latency.** Count, OK, errors, avg, p50, p95 per window.
@@ -398,7 +454,15 @@ and `listen_port` — those require a restart.
 | Key | Default | Notes |
 |---|---|---|
 | `upstream_base_url` | `https://api.anthropic.com` | Where to forward. |
-| `listen_host` / `listen_port` | `127.0.0.1` / `8787` | Local socket. |
+| `listen_host` / `listen_port` | `127.0.0.1` / `8787` | Human-lane socket. |
+| `throttle_listen_port` | `8788` | Automation-lane port; `null` disables the second lane. |
+| `auto_pacing_enabled` | `true` | Master switch for automation-lane pacing. |
+| `human_demand_safety` | `1.5` | Multiplier on predicted human demand (higher = more headroom, slower auto). |
+| `human_demand_horizon_seconds` | `3600` | Window over which the human request rate is averaged. |
+| `human_quota_floor` | `0` | Hard floor of requests always kept free for humans (0 = purely statistical). |
+| `auto_concurrency_reserve` | `0` | Concurrency slots reserved for humans (auto capped at `max_concurrent −` this). |
+| `auto_assumed_request_seconds` | `30.0` | Assumed request time before latency is measured. |
+| `auto_poll_seconds` | `1.0` | How often a parked/over-pace auto request re-checks. |
 | `initial_tier` | `low` | `low` or `high`. |
 | `force_tier` | `null` | `null` = auto, `"low"` / `"high"` = pin. |
 | `tiers.<tier>.max_concurrent` | `4` / `1000` | Concurrency cap for each tier (`low` / `high`). |

@@ -47,7 +47,31 @@ CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "config.yaml")).resolve()
 DEFAULT_CONFIG: dict[str, Any] = {
     "upstream_base_url": "https://api.anthropic.com",
     "listen_host": "127.0.0.1",
-    "listen_port": 8787,
+    "listen_port": 8787,            # human lane (unthrottled)
+    # Automation lane (paced). A second listening port for scripts / tight loops;
+    # set to null to disable the second lane entirely. Both ports share the same
+    # upstream, queue, tier auto-detection, and quota window — they differ only
+    # in admission policy: the human port is never throttled and has concurrency
+    # priority; the auto port is paced by AutoPacer to spend only the leftover
+    # budget without starving the human (statistically).
+    "throttle_listen_port": 8788,
+    "auto_pacing_enabled": True,
+    # Predicted human demand = human_demand_safety * observed_human_rate *
+    # time_left. Higher safety leaves more headroom for humans (slower auto).
+    "human_demand_safety": 1.5,
+    # Trailing horizon (seconds) over which the human request rate is measured.
+    "human_demand_horizon_seconds": 3600,
+    # Optional hard floor of requests always kept free for humans (0 = purely
+    # statistical, the default the user asked for).
+    "human_quota_floor": 0,
+    # Concurrency slots reserved for humans (auto in-flight is capped at
+    # max_concurrent - this). 0 relies on human queue-priority alone.
+    "auto_concurrency_reserve": 0,
+    # Assumed request seconds before any latency has been measured (pacer uses
+    # the live EWMA once traffic exists).
+    "auto_assumed_request_seconds": 30.0,
+    # How often a parked/over-pace auto request re-checks whether it may go.
+    "auto_poll_seconds": 1.0,
     "initial_tier": "low",
     "force_tier": None,
     # Each tier has a max concurrency cap and its own rolling request-quota
@@ -152,6 +176,21 @@ class Limiter:
         self._in_flight = 0
         self._waiters = 0
         self._probe_in_flight = False
+        # Lane accounting. The proxy fronts two ingress ports: a "human" lane
+        # (unthrottled, concurrency-priority) and an "auto" lane (paced by
+        # AutoPacer). The limiter tracks per-lane in-flight + waiters so human
+        # callers are admitted ahead of automation, and so automation can be
+        # capped below the concurrency limit when a reserve is configured.
+        self._human_in_flight = 0
+        self._auto_in_flight = 0
+        self._human_waiters = 0
+        self._auto_waiters = 0
+        self._auto_concurrency_reserve = 0
+        # Recent human-request arrival times (monotonic), used to estimate
+        # future human demand for the pacer. Trimmed to _human_horizon.
+        self._human_times: deque[float] = deque()
+        self._human_horizon = 3600.0
+        self._started_at = time.monotonic()
         # Rolling request-quota window. The limit/duration come from the ACTIVE
         # tier (LOW and HIGH each have their own), so they switch when the tier
         # does. Anchored at the first request after the previous window expired,
@@ -312,15 +351,43 @@ class Limiter:
         log.info(f"window: restored count={count} started_at={start}")
         return True
 
-    async def acquire(self) -> bool:
+    async def acquire(self, lane: str = "human") -> bool:
+        """Acquire a concurrency slot for `lane` ("human" | "auto").
+
+        Human callers take priority: an auto request is never admitted while a
+        human is waiting for a slot, and auto in-flight is capped at
+        `max_concurrent - auto_concurrency_reserve` so a reserve (if configured)
+        is always free for humans. Only human requests trigger HIGH-tier probes.
+        Returns True if this call was admitted as a speculative probe.
+        """
+        is_auto = lane == "auto"
         async with self._cond:
             self._waiters += 1
+            if is_auto:
+                self._auto_waiters += 1
+            else:
+                self._human_waiters += 1
+                self._note_human()
             try:
                 while True:
                     now = time.monotonic()
+                    free = self._in_flight < self._active.max_concurrent
 
-                    if self._in_flight < self._active.max_concurrent:
+                    if is_auto:
+                        auto_cap = max(0, self._active.max_concurrent - self._auto_concurrency_reserve)
+                        if free and self._human_waiters == 0 and self._auto_in_flight < auto_cap:
+                            self._in_flight += 1
+                            self._auto_in_flight += 1
+                            self._n_requests += 1
+                            return False
+                        # Auto never probes — let human traffic drive promotion.
+                        self._n_concurrency_waits += 1
+                        await self._cond.wait()
+                        continue
+
+                    if free:
                         self._in_flight += 1
+                        self._human_in_flight += 1
                         self._n_requests += 1
                         return False
 
@@ -333,6 +400,7 @@ class Limiter:
                     )
                     if can_probe:
                         self._in_flight += 1
+                        self._human_in_flight += 1
                         self._n_requests += 1
                         self._probe_in_flight = True
                         self._n_probes_sent += 1
@@ -346,10 +414,60 @@ class Limiter:
                     await self._cond.wait()
             finally:
                 self._waiters -= 1
+                if is_auto:
+                    self._auto_waiters -= 1
+                else:
+                    self._human_waiters -= 1
 
-    async def release_success(self, was_probe: bool) -> None:
+    def _release_slot(self, lane: str) -> None:
+        self._in_flight -= 1
+        if lane == "auto":
+            self._auto_in_flight = max(0, self._auto_in_flight - 1)
+        else:
+            self._human_in_flight = max(0, self._human_in_flight - 1)
+
+    # -- human-demand tracking (for AutoPacer) --
+
+    def _note_human(self) -> None:
+        """Record a human arrival and trim history to the demand horizon."""
+        now = time.monotonic()
+        self._human_times.append(now)
+        cutoff = now - self._human_horizon
+        while self._human_times and self._human_times[0] < cutoff:
+            self._human_times.popleft()
+
+    def human_rate(self) -> float:
+        """Smoothed human requests/second, averaged over the demand horizon.
+
+        Deliberately divides by the *horizon* (not the span to the oldest
+        sample) so a short burst of human requests is amortized rather than
+        extrapolated as a sustained high rate — otherwise a quick flurry of human
+        calls would make the auto pacer predict enormous future demand and park
+        for the rest of the window. Real-time protection against sudden human
+        spikes is handled separately by concurrency priority + the HIGH probe;
+        this average only feeds the slower *quota* prediction.
+
+        Until the proxy has been up for a full horizon, the elapsed uptime is
+        used as the denominator (capped at the horizon) so early estimates
+        aren't artificially diluted toward zero.
+        """
+        now = time.monotonic()
+        cutoff = now - self._human_horizon
+        while self._human_times and self._human_times[0] < cutoff:
+            self._human_times.popleft()
+        if not self._human_times:
+            return 0.0
+        elapsed = now - self._started_at
+        denom = min(self._human_horizon, max(1.0, elapsed))
+        return len(self._human_times) / denom
+
+    def set_auto_params(self, concurrency_reserve: int, human_horizon: float) -> None:
+        self._auto_concurrency_reserve = max(0, int(concurrency_reserve))
+        self._human_horizon = max(1.0, float(human_horizon))
+
+    async def release_success(self, was_probe: bool, lane: str = "human") -> None:
         async with self._cond:
-            self._in_flight -= 1
+            self._release_slot(lane)
             if was_probe:
                 self._probe_in_flight = False
                 if self._active is self._low and self._forced is None:
@@ -362,9 +480,9 @@ class Limiter:
                     )
             self._cond.notify_all()
 
-    async def release_rate_limited(self, was_probe: bool) -> None:
+    async def release_rate_limited(self, was_probe: bool, lane: str = "human") -> None:
         async with self._cond:
-            self._in_flight -= 1
+            self._release_slot(lane)
             self._n_rate_limited += 1
             now = time.monotonic()
             if was_probe:
@@ -383,9 +501,9 @@ class Limiter:
                 )
             self._cond.notify_all()
 
-    async def release_other_error(self, was_probe: bool) -> None:
+    async def release_other_error(self, was_probe: bool, lane: str = "human") -> None:
         async with self._cond:
-            self._in_flight -= 1
+            self._release_slot(lane)
             self._n_other_errors += 1
             if was_probe:
                 self._probe_in_flight = False
@@ -441,6 +559,10 @@ class Limiter:
                 self._restart_window()
             self._cond.notify_all()
 
+    def window_snapshot(self) -> dict[str, Any]:
+        """Public read of the current rolling-window state (used by AutoPacer)."""
+        return self._window_snapshot()
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "active_tier": self._active.name,
@@ -449,6 +571,12 @@ class Limiter:
             "in_flight": self._in_flight,
             "queued": self._waiters,
             "probe_in_flight": self._probe_in_flight,
+            "lanes": {
+                "human": {"in_flight": self._human_in_flight, "queued": self._human_waiters},
+                "auto": {"in_flight": self._auto_in_flight, "queued": self._auto_waiters,
+                         "concurrency_reserve": self._auto_concurrency_reserve},
+                "human_rate_per_min": round(self.human_rate() * 60.0, 2),
+            },
             "window": self._window_snapshot(),
             "totals": {
                 "requests": self._n_requests,
@@ -460,6 +588,89 @@ class Limiter:
                 "probes_sent": self._n_probes_sent,
             },
         }
+
+
+# ---------- Automation-lane pacing ----------
+
+class AutoPacer:
+    """Paces the automation lane to spend only the *leftover* quota window.
+
+    The human lane is never paced. Automation is admitted at a rate that spreads
+    its share of the window evenly, but the share is computed against *predicted
+    future human demand* rather than a fixed reserve:
+
+        usable   = window_limit - used - safety * human_rate * remaining - floor
+        rate     = usable / remaining            (requests/sec to even-spread)
+        rate     = min(rate, free_slots / avg)   (never schedule faster than the
+                                                   pipe can drain — uses tracked
+                                                   avg request time + tier slots)
+
+    As the window nears its end, `remaining -> 0`, the predicted-human term
+    vanishes, and automation is free to drain whatever is left (up to ~100%).
+    Early on, it holds back exactly what humans are statistically expected to
+    still need. If humans have already consumed the window down to that
+    prediction, `usable <= 0` and automation parks until the window advances or
+    resets. Gating is serialized so the average admission rate is honored;
+    concurrency is still bounded separately by the Limiter (with human priority).
+    """
+
+    def __init__(self, limiter: Limiter, metrics: "Metrics", cfg: dict[str, Any]):
+        self._limiter = limiter
+        self._metrics = metrics
+        self._lock = asyncio.Lock()
+        self._next = 0.0  # loop.time() at which the next auto request may go
+        self.configure(cfg)
+
+    def configure(self, cfg: dict[str, Any]) -> None:
+        self._enabled = bool(cfg.get("auto_pacing_enabled", True))
+        self._safety = max(0.0, float(cfg.get("human_demand_safety", 1.5)))
+        self._floor = max(0.0, float(cfg.get("human_quota_floor", 0)))
+        self._assumed = max(0.1, float(cfg.get("auto_assumed_request_seconds", 30.0)))
+        self._poll = max(0.05, float(cfg.get("auto_poll_seconds", 1.0)))
+
+    def _usable_and_rate(self) -> tuple[float, float]:
+        """Return (usable_requests, target_rate_per_sec) for automation now."""
+        snap = self._limiter.window_snapshot()
+        if not snap["active"]:
+            # No window open yet — the first request anchors it; let it through.
+            return 1.0, float("inf")
+        remaining = float(snap["remaining_seconds"] or 0.0)
+        if remaining <= 0:
+            return 1.0, float("inf")  # window about to roll; drain freely
+        limit = float(snap["limit"])
+        used = float(snap["count"])
+        expected_human = self._safety * self._limiter.human_rate() * remaining
+        usable = limit - used - expected_human - self._floor
+        if usable <= 0:
+            return usable, 0.0
+        rate = usable / remaining
+        # Cap by physical throughput: free slots / avg request time.
+        avg = self._metrics.avg_duration(self._assumed)
+        capacity = max(1, self._limiter._active.max_concurrent) / max(0.1, avg)
+        return usable, min(rate, capacity)
+
+    async def gate(self) -> None:
+        """Block until the calling automation request may proceed."""
+        if not self._enabled:
+            return
+        async with self._lock:
+            while True:
+                usable, rate = self._usable_and_rate()
+                if usable <= 0 or rate <= 0:
+                    # Would eat into predicted human demand — park and re-check.
+                    await asyncio.sleep(self._poll)
+                    continue
+                if rate == float("inf"):
+                    return
+                now = asyncio.get_event_loop().time()
+                if self._next < now:
+                    self._next = now
+                wait = self._next - now
+                if wait > 0:
+                    await asyncio.sleep(min(wait, self._poll))
+                    continue
+                self._next += 1.0 / rate
+                return
 
 
 # ---------- Metrics ----------
@@ -719,6 +930,10 @@ class Metrics:
         self._max_age = max_window_seconds
         self._pricing: dict[str, dict[str, float]] = pricing or {}
         self._persist = persist
+        # EWMA of request duration (seconds), updated per completion. Cheap
+        # O(1) read for AutoPacer (which needs avg request time on every gate);
+        # None until the first completion.
+        self._ewma_duration: float | None = None
 
     def set_pricing(self, pricing: dict[str, dict[str, float]] | None) -> None:
         self._pricing = pricing or {}
@@ -749,8 +964,15 @@ class Metrics:
         cutoff = now - self._max_age
         while self._completions and self._completions[0][0] < cutoff:
             self._completions.popleft()
+        dur = now - started_at
+        self._ewma_duration = dur if self._ewma_duration is None \
+            else 0.2 * dur + 0.8 * self._ewma_duration
         if self._persist is not None:
-            self._persist.record(model, status, now - started_at, u)
+            self._persist.record(model, status, dur, u)
+
+    def avg_duration(self, fallback: float) -> float:
+        """EWMA request duration in seconds, or `fallback` before any data."""
+        return self._ewma_duration if self._ewma_duration is not None else fallback
 
     def set_max_age(self, seconds: float) -> None:
         self._max_age = seconds
@@ -1121,6 +1343,7 @@ config_mtime: float = 0.0
 limiter: Limiter | None = None
 metrics: Metrics | None = None
 pstats: PersistentStats | None = None
+pacer: AutoPacer | None = None
 client: httpx.AsyncClient | None = None
 
 
@@ -1184,7 +1407,7 @@ def parse_window_weights(cfg: dict[str, Any]) -> tuple[dict[str, float], float]:
     return weights, default
 
 
-def init_from_config(cfg: dict[str, Any]) -> tuple[Limiter, Metrics, PersistentStats]:
+def init_from_config(cfg: dict[str, Any]) -> tuple[Limiter, Metrics, PersistentStats, AutoPacer]:
     forced = cfg.get("force_tier") if cfg.get("force_tier") in ("low", "high") else None
     window_weights, default_window_weight = parse_window_weights(cfg)
     lim = Limiter(
@@ -1195,6 +1418,10 @@ def init_from_config(cfg: dict[str, Any]) -> tuple[Limiter, Metrics, PersistentS
         forced=forced,
         window_weights=window_weights,
         default_window_weight=default_window_weight,
+    )
+    lim.set_auto_params(
+        concurrency_reserve=int(cfg.get("auto_concurrency_reserve", 0)),
+        human_horizon=float(cfg.get("human_demand_horizon_seconds", 3600)),
     )
     pricing = cfg.get("model_pricing") or {}
     if not isinstance(pricing, dict):
@@ -1210,7 +1437,8 @@ def init_from_config(cfg: dict[str, Any]) -> tuple[Limiter, Metrics, PersistentS
         pricing=pricing,
         persist=ps,
     )
-    return lim, met, ps
+    pc = AutoPacer(lim, met, cfg)
+    return lim, met, ps, pc
 
 
 async def apply_config_change(new_cfg: dict[str, Any]) -> None:
@@ -1229,6 +1457,11 @@ async def apply_config_change(new_cfg: dict[str, Any]) -> None:
         window_weights=window_weights,
         default_window_weight=default_window_weight,
     )
+    limiter.set_auto_params(
+        concurrency_reserve=int(new_cfg.get("auto_concurrency_reserve", 0)),
+        human_horizon=float(new_cfg.get("human_demand_horizon_seconds", 3600)),
+    )
+    pacer.configure(new_cfg)
     metrics.set_max_age(float(new_cfg["metrics_window_seconds"]))
     new_pricing = new_cfg.get("model_pricing") or {}
     new_pricing = new_pricing if isinstance(new_pricing, dict) else {}
@@ -1322,40 +1555,62 @@ try:
 except FileNotFoundError:
     config_mtime = 0.0
 logging.getLogger().setLevel(str(config.get("log_level", "INFO")).upper())
-limiter, metrics, pstats = init_from_config(config)
+limiter, metrics, pstats, pacer = init_from_config(config)
 limiter.load_window_state(load_window_file())
 
 
 # ---------- HTTP app ----------
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+# Background tasks live here so startup()/shutdown() can be called either from
+# the FastAPI lifespan (single-server `uvicorn proxy:app`) or directly from
+# serve() (the dual-port `python proxy.py` path), without double-initializing.
+_bg_tasks: list[asyncio.Task] = []
+
+
+async def startup() -> None:
     global client
+    if client is not None:
+        return
     client = httpx.AsyncClient(
         base_url=str(config["upstream_base_url"]).rstrip("/"),
         timeout=httpx.Timeout(float(config["upstream_timeout"]), connect=15.0),
         limits=httpx.Limits(max_connections=None, max_keepalive_connections=100),
     )
-    watcher = asyncio.create_task(config_watch_loop())
-    persister = asyncio.create_task(persist_loop())
+    _bg_tasks.append(asyncio.create_task(config_watch_loop()))
+    _bg_tasks.append(asyncio.create_task(persist_loop()))
+    human = f"http://{config['listen_host']}:{config['listen_port']}"
+    auto_port = config.get("throttle_listen_port")
+    auto = f" | auto-lane http://{config['listen_host']}:{auto_port}" if auto_port else ""
     log.info(
-        f"anthropic_proxy on http://{config['listen_host']}:{config['listen_port']} "
-        f"-> {config['upstream_base_url']} | tier={limiter._active.name} "
-        f"forced={limiter._forced} | dashboard: /_proxy/"
+        f"anthropic_proxy human-lane {human}{auto} -> {config['upstream_base_url']} "
+        f"| tier={limiter._active.name} forced={limiter._forced} | dashboard: /_proxy/"
     )
+
+
+async def shutdown() -> None:
+    global client
+    for task in _bg_tasks:
+        task.cancel()
+    for task in _bg_tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _bg_tasks.clear()
+    await pstats.maybe_flush(force=True)
+    await asyncio.to_thread(save_window_file)
+    if client is not None:
+        await client.aclose()
+        client = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await startup()
     try:
         yield
     finally:
-        watcher.cancel()
-        persister.cancel()
-        for task in (watcher, persister):
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        await pstats.maybe_flush(force=True)
-        await asyncio.to_thread(save_window_file)
-        await client.aclose()
+        await shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1812,6 +2067,15 @@ async function tick() {
     const W = L.window || {active:false};
     const winHrs = (W.window_seconds || 18000) / 3600;
     const winLabel = (Number.isInteger(winHrs) ? winHrs : winHrs.toFixed(1)) + "h Window";
+    const lanes = L.lanes || {human:{in_flight:0,queued:0}, auto:{in_flight:0,queued:0,concurrency_reserve:0}, human_rate_per_min:0};
+    const autoQ = lanes.auto.queued || 0;
+    const laneCard = `
+      <div class="stat">
+        <div class="label">Lanes · human / auto</div>
+        <div class="value">${lanes.human.in_flight} / ${lanes.auto.in_flight}</div>
+        <div class="sub">${autoQ > 0 ? autoQ + " auto paced · " : ""}human ~${lanes.human_rate_per_min}/min${lanes.auto.concurrency_reserve ? " · reserve " + lanes.auto.concurrency_reserve : ""}</div>
+      </div>`;
+
     let winCard;
     if (!W.active) {
       winCard = `
@@ -1850,6 +2114,7 @@ async function tick() {
         <div class="value">${L.queued}</div>
         <div class="sub">${L.queued > 0 ? "waiting for slot" : "idle"}</div>
       </div>
+      ${laneCard}
       ${winCard}
       <div class="stat">
         <div class="label">Lifetime</div>
@@ -2213,6 +2478,21 @@ async def set_window_start_endpoint(req: Request):
 
 # ---------- Proxy handler ----------
 
+def request_lane(request: Request) -> str:
+    """Which ingress lane a request arrived on, decided by listening port.
+
+    The automation port (`throttle_listen_port`) is the paced lane; the human
+    `listen_port` (and anything else) is unthrottled. Reads the server port from
+    the ASGI scope, falling back to the URL port.
+    """
+    auto_port = config.get("throttle_listen_port")
+    if auto_port is None:
+        return "human"
+    server = request.scope.get("server")
+    port = server[1] if server and len(server) >= 2 else request.url.port
+    return "auto" if port == int(auto_port) else "human"
+
+
 @app.api_route(
     "/{full_path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
@@ -2227,7 +2507,13 @@ async def proxy(full_path: str, request: Request):
         if k.lower() not in HOP_BY_HOP
     }
     model = extract_model(request.method, body)
+    lane = request_lane(request)
     started_at = metrics.request_started(model)
+    # Automation lane: wait for the pacer before committing the request to the
+    # quota window. The human lane is never paced. (gate() can park for a while
+    # when the window is nearly spent; it holds no concurrency slot meanwhile.)
+    if lane == "auto":
+        await pacer.gate()
     limiter.note_request(model)
 
     finished = False
@@ -2251,7 +2537,7 @@ async def proxy(full_path: str, request: Request):
         conn_errors = 0
         while True:
             attempt += 1
-            was_probe = await limiter.acquire()
+            was_probe = await limiter.acquire(lane)
             try:
                 outbound = client.build_request(
                     method=request.method, url=target,
@@ -2259,7 +2545,7 @@ async def proxy(full_path: str, request: Request):
                 )
                 response = await client.send(outbound, stream=True)
             except httpx.HTTPError as e:
-                await limiter.release_other_error(was_probe)
+                await limiter.release_other_error(was_probe, lane)
                 conn_errors += 1
                 log.warning(
                     f"upstream error attempt={attempt} "
@@ -2281,7 +2567,7 @@ async def proxy(full_path: str, request: Request):
                     rl_body = await response.aread()
                 finally:
                     await response.aclose()
-                await limiter.release_rate_limited(was_probe)
+                await limiter.release_rate_limited(was_probe, lane)
                 remaining = deadline - time.monotonic()
                 backoff = compute_backoff(
                     attempt, retry_after, retry_after_cap=max(0.0, remaining)
@@ -2323,9 +2609,9 @@ async def proxy(full_path: str, request: Request):
                     except Exception:
                         pass
                     if is_success:
-                        await limiter.release_success(was_probe)
+                        await limiter.release_success(was_probe, lane)
                     else:
-                        await limiter.release_other_error(was_probe)
+                        await limiter.release_other_error(was_probe, lane)
                     usage = extractor.final_usage() if is_success else None
                     finalize(status_code, usage)
 
@@ -2340,13 +2626,35 @@ async def proxy(full_path: str, request: Request):
             metrics.request_finished(model, started_at, 0)
 
 
-if __name__ == "__main__":
+async def serve() -> None:
+    """Run the human lane and (if configured) the automation lane together.
+
+    Both ports serve the same app + shared state; startup()/shutdown() run once
+    around them, so there is a single upstream client, queue, and set of
+    background tasks regardless of how many ports are listening.
+    """
     import uvicorn
 
-    uvicorn.run(
-        app,
-        host=config["listen_host"],
-        port=int(config["listen_port"]),
-        log_level=str(config.get("log_level", "info")).lower(),
-        access_log=False,
-    )
+    host = str(config["listen_host"])
+    log_level = str(config.get("log_level", "info")).lower()
+    ports = [int(config["listen_port"])]
+    auto_port = config.get("throttle_listen_port")
+    if auto_port is not None and int(auto_port) not in ports:
+        ports.append(int(auto_port))
+
+    await startup()
+    servers = [
+        uvicorn.Server(uvicorn.Config(
+            app, host=host, port=p, lifespan="off",
+            log_level=log_level, access_log=False,
+        ))
+        for p in ports
+    ]
+    try:
+        await asyncio.gather(*(s.serve() for s in servers))
+    finally:
+        await shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(serve())
