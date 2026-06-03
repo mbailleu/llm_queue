@@ -25,28 +25,35 @@ actually pace the client.
 
 ## Files
 
+The code is a Python **package** (`anthropic_proxy/`); `proxy.py` is now just a
+thin compatibility shim. See [Package layout](#package-layout) for the module map.
+
 | File | Purpose |
 |------|---------|
-| `proxy.py` | The entire application (~2000 lines): limiter, metrics, persistence, dashboard HTML/JS, and the proxy handler. |
+| `anthropic_proxy/` | The application package (limiter, pacer, metrics, persistence, runtime/config, server, routes, dashboard). |
+| `proxy.py` | ~20-line shim: re-exports `app` + `serve` so `python proxy.py` / `uv run proxy.py` / `uvicorn proxy:app` still work (keeps the PEP 723 header). |
+| `pyproject.toml` | Package metadata, deps, `anthropic-proxy` console script. |
 | `config.yaml` | Runtime config. **Hot-reloaded** (polled every `config_poll_seconds`). Heavily commented — read it for the meaning of every knob. |
 | `stats.json` | Disk-persisted long-horizon stats (gitignored). Written by `PersistentStats`. |
 | `window.json` | Disk-persisted current rolling-window state — request count + start time (gitignored). Restored on boot unless already elapsed. |
 | `statusline.sh` | Polls `/_proxy/statusline` for a compact tmux / Claude Code / zellij / wezterm status bar line. |
-| `requirements.txt` | fastapi, httpx, uvicorn, pyyaml. (`proxy.py` also has a PEP 723 `# /// script` header for `uv run`.) |
+| `requirements.txt` | fastapi, httpx, uvicorn, pyyaml. |
+| `tests/` | pytest unit suite for the pure modules (usage / limiter / metrics / persistence / pacer). |
 | `README.md` | User-facing setup + usage docs. |
 
-## How `proxy.py` is organized (where things live)
+## Where things live
 
-Everything is in `proxy.py`, in this order. Symbol names below are greppable —
+The components below were split out of the old single file into the package
+modules listed in [Package layout](#package-layout). Symbol names are greppable —
 exact line numbers are deliberately omitted since they drift on every edit.
 
-### Config + defaults — top of file
+### Config + defaults — `runtime.py`
 - `DEFAULT_CONFIG`: every config key with its default and an inline explanation.
   Source of truth for what's configurable.
 - `RATE_LIMIT_STATUSES = {429, 503, 529}`, `HOP_BY_HOP` headers to strip,
   `METRIC_WINDOWS`.
 
-### Tier + concurrency limiter
+### Tier + concurrency limiter — `limiter.py`
 - `Tier`: name + `max_concurrent` + its **own rolling request-quota window**
   (`window_seconds` / `window_limit`). LOW defaults to 600 / 5h, HIGH to
   99999 / 1h.
@@ -79,7 +86,7 @@ exact line numbers are deliberately omitted since they drift on every edit.
   - `snapshot()`: the JSON state (incl. per-lane in-flight/queued + human rate)
     used by dashboard/statusline.
 
-### Automation-lane pacing
+### Automation-lane pacing — `pacer.py`
 - `AutoPacer`: paces the `"auto"` lane so it spends only the *leftover* quota.
   `gate()` blocks an auto request until it may proceed; `_usable_and_rate()`
   computes `usable = window_limit − used − safety·human_rate·time_left − floor`
@@ -88,7 +95,7 @@ exact line numbers are deliberately omitted since they drift on every edit.
   humans already spent the window, `usable ≤ 0` and auto parks. `configure()` is
   re-called on config reload. The human lane never touches the pacer.
 
-### Metrics + usage parsing
+### Metrics + usage parsing — `metrics.py` + `usage.py`
 - `normalize_usage()`: maps the three provider usage wire formats to one
   canonical 4-field shape (input / output / cache_creation / cache_read).
 - `SSEUsageExtractor`: scrapes usage out of streaming SSE bodies (Anthropic
@@ -102,7 +109,7 @@ exact line numbers are deliberately omitted since they drift on every edit.
   `overall` + `per_model` windowed summaries. `avg_duration()` exposes a cheap
   O(1) EWMA latency that `AutoPacer` reads on every gate.
 
-### Persistent long-horizon stats
+### Persistent long-horizon stats — `persistence.py`
 - `PersistentStats`: folds completions into **hourly per-model buckets** +
   lifetime totals, flushes to `stats.json` on an interval.
   - `record()`: called from `Metrics.request_finished`.
@@ -111,7 +118,7 @@ exact line numbers are deliberately omitted since they drift on every edit.
   - Cost is computed at read time from current pricing (re-pricing is
     retroactive); percentiles aren't kept long-term (only `duration_sum` → avg).
 
-### Config loading + hot-reload
+### Config loading + hot-reload — `runtime.py`
 - Module globals: `config`, `limiter`, `metrics`, `pstats`, `pacer`, `client`.
 - `load_config_file()`: merges YAML over `DEFAULT_CONFIG`.
 - `init_from_config()`: builds the limiter/metrics/pstats/**pacer** (returns all
@@ -122,9 +129,10 @@ exact line numbers are deliberately omitted since they drift on every edit.
 - `config_watch_loop()` + `persist_loop()`: background tasks. `persist_loop`
   also drives `save_window_file()` (window.json).
 - `load_window_file()` / `save_window_file()`: window.json read/write helpers;
-  the bootstrap block restores window state via `limiter.load_window_state()`.
+  `bootstrap()` populates the runtime state at import and restores window state
+  via `limiter.load_window_state()`.
 
-### HTTP app
+### HTTP app — `server.py`
 - `startup()` / `shutdown()`: create/tear down the shared `httpx.AsyncClient`
   and background tasks **once**, idempotently. Called either by the FastAPI
   `lifespan` (single-server) or directly by `serve()` (dual-port). This split is
@@ -142,7 +150,7 @@ exact line numbers are deliberately omitted since they drift on every edit.
     before first paint (no flash). SVG charts read `--grid` at draw time, so they
     repaint on theme/OS change.
 
-### Endpoints
+### Endpoints — `routes.py`
 - `GET /_proxy/` — dashboard. `GET /_proxy/metrics` — full JSON snapshot.
 - `GET /_proxy/series` — graph data. `GET /_proxy/status` — limiter snapshot.
 - `GET /_proxy/statusline` — compact `plain|tmux|ansi` status line.
@@ -154,7 +162,7 @@ exact line numbers are deliberately omitted since they drift on every edit.
   immediately. Example:
   `curl -X POST localhost:8787/_proxy/window/count -d '{"count": 120}'`
 
-### The proxy handler
+### The proxy handler — `server.py`
 - `request_lane()`: decides `"human"` vs `"auto"` from the **server port** the
   request arrived on (`throttle_listen_port` ⇒ auto), read from the ASGI scope.
 - `proxy()` is the catch-all route for every other path/method. Flow:
@@ -179,7 +187,10 @@ per port (human + auto) with `lifespan="off"`, wrapping them in a single
 
 ```bash
 pip install -r requirements.txt
-python proxy.py            # or: uv run proxy.py   (PEP 723 header)
+python proxy.py                  # shim — or: uv run proxy.py (PEP 723 header)
+python -m anthropic_proxy        # package entrypoint
+uvicorn anthropic_proxy:app      # single-port (ASGI app directly)
+pytest tests/                    # unit suite for the pure modules
 ```
 
 Two ports listen by default: the **human lane** on `listen_port` (8787) and the
@@ -189,8 +200,10 @@ at 8787, scripts at 8788. Open the dashboard at `http://127.0.0.1:8787/_proxy/`.
 
 ## Conventions / things to know when editing
 
-- **Single file, no framework beyond FastAPI.** The dashboard is an inline HTML
-  string with vanilla JS — keep it self-contained (no bundler).
+- **Package, no framework beyond FastAPI.** The dashboard is plain
+  HTML/CSS/JS under `anthropic_proxy/dashboard/`, served as static files — keep it
+  dependency-free (no bundler). Edit `index.html` / `styles.css` / `app.js`
+  directly; the no-flash theme `<script>` must stay inline in `<head>`.
 - **The event loop is single-threaded**, so `Limiter` / `AutoPacer` counters are
   mutated without locks where comments say "synchronous and await-free" (e.g.
   `note_request`, the window setters); preserve that atomicity. Lane in-flight
@@ -208,92 +221,64 @@ at 8787, scripts at 8788. Open the dashboard at `http://127.0.0.1:8787/_proxy/`.
   written by `persist_loop` (~5s) and on shutdown; deleting them only loses that
   state. `window.json` is discarded on load if its window has already elapsed.
 
-## Planned refactor (single file → package)
+## Package layout
 
-`proxy.py` is ~2.1k lines and growing; the next maintainability step is to split
-it into a package and lift the dashboard HTML/CSS/JS out of the Python string.
-This is a **proposal, not yet done** — the file is still monolithic today.
+The old single `proxy.py` was split into the package below (the file is now a
+~20-line shim). Dependency direction is acyclic, with the pure modules at the
+bottom and the web layer on top.
 
-### Why
-- One 2k-line module mixes five concerns (limiter, metrics, persistence,
-  dashboard, HTTP). Each is independently testable but currently can't be
-  imported without pulling in FastAPI.
-- The dashboard is a ~600-line triple-quoted string — no HTML/CSS/JS editor
-  support, no linting, awkward diffs.
-- Shared mutable module globals (`config`, `limiter`, `metrics`, `pstats`,
-  `pacer`, `client`) make the hot-reload + dual-server wiring hard to follow and
-  to test.
-
-### Target structure
 ```
+proxy.py                     # compatibility shim (re-exports app + serve)
+pyproject.toml               # metadata, deps, `anthropic-proxy` console script
+config.yaml  statusline.sh  requirements.txt
 anthropic_proxy/
-  pyproject.toml            # deps + console entrypoint (supersedes requirements.txt
-                            # and the PEP 723 header; keep a thin proxy.py shim so
-                            # `uv run proxy.py` still works)
-  config.yaml
-  statusline.sh
-  anthropic_proxy/
-    __init__.py
-    __main__.py             # `python -m anthropic_proxy` → serve()
-    state.py                # AppState dataclass: holds config/limiter/metrics/
-                            # pstats/pacer/client instead of module globals
-    config.py               # DEFAULT_CONFIG, load_config_file, make_tier,
-                            # parse_window_weights, apply_config_change, watch loop
-    limiter.py              # Tier, Limiter (concurrency, tiers, window, lanes,
-                            # human-demand tracking)
-    pacer.py                # AutoPacer (automation-lane quota pacing)
-    usage.py                # normalize_usage, SSE/JSON extractors, make_extractor,
-                            # extract_model        (pure, no FastAPI)
-    metrics.py              # compute_cost, _stats, Metrics (+ EWMA avg)
-    persistence.py          # PersistentStats + window.json load/save
-    server.py               # FastAPI app, startup/shutdown, serve() (two ports),
-                            # backoff helpers, request_lane, proxy handler
-    routes.py               # all /_proxy/* endpoints (incl. window + boost)
-    dashboard/
-      index.html            # markup (keeps the tiny inline no-flash theme script)
-      styles.css
-      app.js
-  tests/
-    test_usage.py  test_limiter.py  test_metrics.py
-    test_persistence.py  test_pacer.py
+  __init__.py                # lazy `app` / `serve` (pure modules import w/o FastAPI)
+  __main__.py                # `python -m anthropic_proxy` → serve()
+  _log.py                    # shared logger
+  usage.py                   # normalize_usage, SSE/JSON extractors, extract_model  (pure)
+  metrics.py                 # compute_cost, _stats, Metrics (+ EWMA avg), METRIC_WINDOWS  (pure)
+  persistence.py             # PersistentStats  (pure; depends on metrics.compute_cost)
+  limiter.py                 # Tier, Limiter — tiers, window, lanes, human-demand  (pure)
+  pacer.py                   # AutoPacer  (pure; reads limiter window + metrics avg)
+  runtime.py                 # config + state (config/limiter/metrics/pstats/pacer/client),
+                             # load/make_tier/parse_window_weights/init_from_config,
+                             # apply_config_change, watch + persist loops, window.json,
+                             # RATE_LIMIT_STATUSES/HOP_BY_HOP, bootstrap()
+  server.py                  # FastAPI app, startup/shutdown/lifespan, serve() (two ports),
+                             # backoff, request_lane, the catch-all proxy handler
+  routes.py                  # all /_proxy/* endpoints + dashboard (StaticFiles mount)
+  dashboard/                 # index.html + styles.css + app.js (served statically)
+tests/                       # pytest unit suite for the pure modules
 ```
 
-### Dashboard separation
-- Move `<style>` → `dashboard/styles.css`, the main `<script>` → `dashboard/app.js`,
-  markup → `dashboard/index.html` linking `/_proxy/static/...`.
-- Serve `dashboard/` via `StaticFiles` (or read the files once at startup). Keep
-  the ~8-line no-flash theme script inline in `<head>` (must run before paint).
-- Net effect: real editor/linter support for the front-end; Python no longer
-  carries a 600-line string.
+### State ownership
+Rather than scattered module globals (or threading `app.state` through every
+endpoint), all process-wide mutable state lives on the **`runtime` module**:
+`runtime.config`, `runtime.limiter`, `runtime.metrics`, `runtime.pstats`,
+`runtime.pacer`, `runtime.client`. `server.py` / `routes.py` read/write
+`runtime.<name>`; `runtime.bootstrap()` builds them at import. This is the
+singleton-module form of the "AppState" idea — one owner, easy hot-reload
+rebinding (the `apply_config_change` / `config_watch_loop` functions live in
+`runtime` and keep using `global`).
 
-### The central refactor: kill the module globals
-Replace the six module-level globals with a single `AppState` object created in
-`startup()` and stored on `app.state`. Routes/handlers read `request.app.state`.
-This is the highest-leverage change — it's what makes `config.py`, `limiter.py`,
-etc. independently importable and testable, and untangles hot-reload + the
-two-server lifecycle.
+### Import / registration order (don't break it)
+- `server.py` imports `runtime` and calls `bootstrap()`, defines `app`, then
+  `from . import routes` (registers the `/_proxy/*` routes + `/_proxy/static`
+  mount), and **only then** defines the catch-all `/{full_path:path}` handler —
+  so specific routes match before the catch-all.
+- `routes.py` does `from .server import app` (circular but safe: `app` already
+  exists when routes is imported mid-`server`).
+- `__init__.py` resolves `app`/`serve` lazily (PEP 562) so importing the pure
+  modules (e.g. in tests) doesn't pull in FastAPI.
 
-### Suggested order (each step independently shippable)
-1. Extract the **pure** modules first — `usage.py`, `metrics.py`, `limiter.py`,
-   `pacer.py`, `persistence.py` — and add `tests/` for them (the stubbed-import
-   tests in this session become real unit tests). No behavior change.
-2. Extract `config.py` (loading + hot-reload).
-3. Introduce `AppState`; convert globals → `app.state`.
-4. Split out `routes.py` and `server.py` (incl. `serve()` / `startup` /
-   `shutdown` / `request_lane`).
-5. Externalize the dashboard into `dashboard/` + `StaticFiles`.
-6. Add `pyproject.toml` + `__main__.py`; keep `proxy.py` as a shim importing
-   `anthropic_proxy.server:app` so existing `uv run proxy.py` / docs still work.
-
-### Watch out for
+### If you extend it
 - **Atomicity:** `Limiter` / `AutoPacer` await-free counter mutations rely on the
-  single-threaded loop — keep them sync when moving them.
+  single-threaded loop — keep them sync.
 - **Two-lane invariants:** one shared upstream client + quota window; lane only
-  changes admission policy. `pacer.py` depends on `limiter.py` + `metrics.py`
-  (avg latency) — keep that direction acyclic.
-- **Hot-reload contract:** new config keys must still flow through
-  `DEFAULT_CONFIG` → `config.py` builders → `apply_config_change`
-  (+ `pacer.configure` / `limiter.set_auto_params`).
-- **Entry-point compatibility:** `serve()` runs two `uvicorn.Server`s under one
-  `startup`/`shutdown`; don't reintroduce per-server lifespan double-init. Don't
-  break `uv run proxy.py` or the `ANTHROPIC_BASE_URL=…:8787` workflow.
+  changes admission policy. Keep `pacer` → `limiter`/`metrics` acyclic.
+- **Hot-reload contract:** new config keys flow through `DEFAULT_CONFIG` →
+  `runtime` builders → `apply_config_change` (+ `pacer.configure` /
+  `limiter.set_auto_params`), and get documented in `config.yaml`.
+- **Possible next steps (not done):** promote `runtime` to a real `AppState`
+  dataclass on `app.state`; add a `pyproject` optional-deps group for tests; add
+  HTTP-level integration tests alongside the unit suite.

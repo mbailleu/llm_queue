@@ -32,17 +32,27 @@ Anthropic, OpenAI Chat Completions, and OpenAI Responses `usage` shapes).
 ## Layout
 
 ```
-proxy.py          single-file FastAPI app (PEP 723 inline deps)
+anthropic_proxy/  the application package
+  usage.py        provider usage parsing (pure)
+  metrics.py      timing/token/cost metrics (pure)
+  persistence.py  long-horizon stats -> stats.json (pure)
+  limiter.py      tiers, quota window, human/auto lanes (pure)
+  pacer.py        automation-lane pacing (pure)
+  runtime.py      config load + hot-reload + shared state
+  server.py       FastAPI app, lifecycle, two-port serve(), proxy handler
+  routes.py       /_proxy/* endpoints + dashboard
+  dashboard/      index.html + styles.css + app.js (served statically)
+proxy.py          compatibility shim (python proxy.py / uv run proxy.py)
+pyproject.toml    package metadata + `anthropic-proxy` console script
 config.yaml       all settings; hot-reloaded
 statusline.sh     wrapper for Claude Code / tmux status bars
 requirements.txt  for pip users
+tests/            pytest unit suite for the pure modules
 stats.json        persisted long-horizon stats (auto-created; git-ignored)
 window.json       persisted current quota-window state (auto-created; git-ignored)
 ```
 
-> The whole app currently lives in `proxy.py`. A planned split into a package
-> (limiter / metrics / persistence / dashboard / server) is sketched in
-> [`CLAUDE.md`](CLAUDE.md).
+> Architecture notes and the module map live in [`CLAUDE.md`](CLAUDE.md).
 
 ## Run it
 
