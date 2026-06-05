@@ -66,10 +66,18 @@ exact line numbers are deliberately omitted since they drift on every edit.
   - `_restart_window()`: called on **every tier change** (promotion, demotion,
     boost, or a forced config switch) — resets the count + timer so the window
     re-anchors under the new active tier's limit/duration.
-  - `note_request()` / `_window_snapshot()` / `window_snapshot()`: track the
-    rolling request-quota **window** for the *active* tier (dashboard "X / N this
-    window" indicator — tracked, NOT enforced), including per-model
-    `model_window_weights`.
+  - `note_request()` / `discount_request()` / `_window_snapshot()` /
+    `window_snapshot()`: track the rolling request-quota **window** for the
+    *active* tier (dashboard "X / N this window" indicator — tracked, NOT
+    enforced), including per-model `model_window_weights`. `note_request(model,
+    lane)` returns `(weight, window_token)` and also folds the weight into a
+    per-lane split (`_window_human_count` / `_window_auto_count`, invariant: they
+    sum to `_window_count`); the snapshot exposes `count_human` / `count_auto`
+    plus a `projected_human` end-of-window estimate (`count_human +
+    human_rate·remaining`). `discount_request(weight, token, lane)` reverses both
+    the total and the lane count when a request ultimately fails (so the window
+    counts only quota that was actually consumed), no-op if the window has since
+    rolled. The split is persisted in `window.json` and restored on boot.
   - `_note_human()` / `human_rate()`: track human arrivals (a `deque` over
     `human_demand_horizon`) and report a horizon-averaged rate for the pacer.
   - `set_window_count()` / `set_window_start()`: manual overrides behind the
@@ -82,10 +90,19 @@ exact line numbers are deliberately omitted since they drift on every edit.
 ### Automation-lane pacing
 - `AutoPacer`: paces the `"auto"` lane so it spends only the *leftover* quota.
   `gate()` blocks an auto request until it may proceed; `_usable_and_rate()`
-  computes `usable = window_limit − used − safety·human_rate·time_left − floor`
-  and a target rate `usable/time_left`, capped by `max_concurrent/avg_request_time`.
-  Near window end the predicted-human term vanishes so auto can drain ~100%; if
-  humans already spent the window, `usable ≤ 0` and auto parks. `configure()` is
+  computes `usable = window_limit − used − safety·human_rate·min(time_left,
+  lookahead) − floor` and a target rate `usable/time_left`, capped by
+  `max_concurrent/avg_request_time`. The `min(…, lookahead)`
+  (`human_demand_lookahead_seconds`) stops a long (e.g. 5h LOW) window from
+  reserving nearly all quota off a small human rate. Near window end the
+  predicted-human term vanishes so auto can drain ~100%; if humans already spent
+  the window, `usable ≤ 0` and auto parks. `gate()` clamps its internal `_next`
+  schedule to at most one *current* interval ahead, so a rate jump (window/tier
+  change) releases parked requests immediately instead of stranding them behind a
+  stale slow schedule. `_parked` counts requests held in `gate()`; `status()`
+  exposes `{parked, usable, rate_per_min, next_seconds, reason, count_auto,
+  projected_auto}` for the dashboard "Auto Pacing" card + statusline
+  (`projected_auto = count_auto + remaining usable budget`). `configure()` is
   re-called on config reload. The human lane never touches the pacer.
 
 ### Metrics + usage parsing
@@ -161,7 +178,8 @@ exact line numbers are deliberately omitted since they drift on every edit.
   1. Read body, strip hop-by-hop headers, extract model, determine lane, start
      metrics.
   2. **Auto lane only:** `await pacer.gate()` before committing (holds no slot
-     while parked); then `limiter.note_request()`.
+     while parked); then `limiter.note_request()` (keeps its `(weight, token)` so
+     `finalize` can `discount_request` the window count on a failed outcome).
   3. Loop: `limiter.acquire(lane)` → stream upstream via the shared client.
      - **Connection errors** retry up to `retry_max_attempts`.
      - **429/503/529** retry against a wall-clock budget

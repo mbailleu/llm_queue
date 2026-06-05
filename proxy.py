@@ -61,6 +61,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "human_demand_safety": 1.5,
     # Trailing horizon (seconds) over which the human request rate is measured.
     "human_demand_horizon_seconds": 3600,
+    # How far ahead (seconds) to project that measured human rate when reserving
+    # quota: the reservation term is human_demand_safety * human_rate *
+    # min(time_left, this). Capping the projection stops a long (e.g. 5h LOW)
+    # window from reserving almost the entire quota off a small human rate.
+    "human_demand_lookahead_seconds": 3600,
     # Optional hard floor of requests always kept free for humans (0 = purely
     # statistical, the default the user asked for).
     "human_quota_floor": 0,
@@ -199,6 +204,12 @@ class Limiter:
         # is restarted on every tier change (see _restart_window).
         self._window_start: float | None = None
         self._window_count = 0.0
+        # The same window count split by ingress lane, so the dashboard can show
+        # how much of the window human vs background (auto) traffic has spent.
+        # Invariant: _window_human_count + _window_auto_count == _window_count
+        # (both move together with note_request / discount_request / restart).
+        self._window_human_count = 0.0
+        self._window_auto_count = 0.0
         # Per-model window weighting. Each entry maps a model (matched exactly,
         # then by substring) to how many "requests" it costs the window count.
         self._window_weights: dict[str, float] = dict(window_weights or {})
@@ -235,8 +246,10 @@ class Limiter:
         """
         self._window_start = None
         self._window_count = 0.0
+        self._window_human_count = 0.0
+        self._window_auto_count = 0.0
 
-    def note_request(self, model: str = "") -> float:
+    def note_request(self, model: str = "", lane: str = "human") -> tuple[float, float]:
         """Count one client request against the rolling quota window.
 
         Called once per client request (not per retry). The request counts as
@@ -245,17 +258,44 @@ class Limiter:
         per-model stats. The window's duration/limit come from the active tier,
         so they follow tier changes. Starts a fresh window when there is none
         active or the current one has elapsed. Synchronous and await-free, so
-        it's atomic under the single-threaded event loop. Returns the weight
-        applied.
+        it's atomic under the single-threaded event loop. Returns
+        `(weight, window_token)`; pass both back to `discount_request` to undo
+        the count if the request ultimately fails (the token identifies the
+        window so a since-rolled window is never wrongly decremented).
         """
         now = time.time()
         window_seconds = float(self._active.window_seconds)
         if self._window_start is None or now - self._window_start >= window_seconds:
             self._window_start = now
             self._window_count = 0.0
+            self._window_human_count = 0.0
+            self._window_auto_count = 0.0
         weight = self._window_weight_for(model)
         self._window_count += weight
-        return weight
+        if lane == "auto":
+            self._window_auto_count += weight
+        else:
+            self._window_human_count += weight
+        return weight, self._window_start
+
+    def discount_request(self, weight: float, window_token: float | None,
+                         lane: str = "human") -> None:
+        """Reverse a previously-noted request that never consumed quota.
+
+        Upstream rate-limit quota only counts requests that actually went
+        through; a request that ultimately failed (rate-limited out, connection
+        error, client abort) should not stay on the window count. No-op when the
+        window has since rolled (token mismatch) so a fresh window is never
+        wrongly reduced. Synchronous and await-free like `note_request`.
+        """
+        if window_token is None or self._window_start != window_token:
+            return
+        weight = max(0.0, float(weight))
+        self._window_count = max(0.0, self._window_count - weight)
+        if lane == "auto":
+            self._window_auto_count = max(0.0, self._window_auto_count - weight)
+        else:
+            self._window_human_count = max(0.0, self._window_human_count - weight)
 
     def _window_snapshot(self) -> dict[str, Any]:
         now = time.time()
@@ -263,6 +303,10 @@ class Limiter:
         window_limit = int(self._active.window_limit)
         ws = self._window_start
         active = ws is not None and now - ws < window_seconds
+
+        def _n(x: float) -> float:
+            return int(x) if float(x).is_integer() else round(x, 2)
+
         if not active:
             return {
                 "active": False,
@@ -270,21 +314,34 @@ class Limiter:
                 "limit": window_limit,
                 "window_seconds": window_seconds,
                 "count": 0,
+                "count_human": 0,
+                "count_auto": 0,
+                "projected_human": 0,
                 "started_at": None,
                 "elapsed_seconds": None,
                 "remaining_seconds": None,
             }
         elapsed = now - ws
+        remaining = max(0.0, window_seconds - elapsed)
         count = self._window_count
+        # Estimated human total by window end: what humans have spent so far plus
+        # their measured arrival rate projected over the time left (raw, no safety
+        # factor — this is a display estimate, not the pacer's reservation). The
+        # background (auto) projection is added by AutoPacer.status() since it
+        # owns the leftover-budget calculation.
+        projected_human = self._window_human_count + self.human_rate() * remaining
         return {
             "active": True,
             "tier": self._active.name,
             "limit": window_limit,
             "window_seconds": window_seconds,
-            "count": int(count) if float(count).is_integer() else round(count, 2),
+            "count": _n(count),
+            "count_human": _n(self._window_human_count),
+            "count_auto": _n(self._window_auto_count),
+            "projected_human": _n(min(projected_human, float(window_limit))),
             "started_at": ws,
             "elapsed_seconds": elapsed,
-            "remaining_seconds": max(0.0, window_seconds - elapsed),
+            "remaining_seconds": remaining,
         }
 
     # -- manual window overrides + persistence (sync, await-free: atomic under
@@ -301,6 +358,10 @@ class Limiter:
         if self._window_start is None or now - self._window_start >= float(self._active.window_seconds):
             self._window_start = now
         self._window_count = max(0.0, float(count))
+        # Keep the lane split consistent: preserve the auto attribution (clamped
+        # to the new total) and assign the remainder to humans.
+        self._window_auto_count = min(self._window_auto_count, self._window_count)
+        self._window_human_count = self._window_count - self._window_auto_count
         return self._window_snapshot()
 
     def set_window_start(self, started_at: float | None) -> dict[str, Any]:
@@ -320,6 +381,8 @@ class Limiter:
         return {
             "started_at": self._window_start,
             "count": self._window_count,
+            "count_human": self._window_human_count,
+            "count_auto": self._window_auto_count,
             "tier": self._active.name,
             "window_seconds": float(self._active.window_seconds),
         }
@@ -341,6 +404,9 @@ class Limiter:
             count = max(0.0, float(state.get("count", 0) or 0))
             window_seconds = float(state.get("window_seconds")
                                    or self._active.window_seconds)
+            auto = max(0.0, float(state.get("count_auto", 0) or 0))
+            human = state.get("count_human")
+            human = max(0.0, float(human)) if human is not None else max(0.0, count - auto)
         except (TypeError, ValueError):
             return False
         if time.time() - start >= window_seconds:
@@ -348,7 +414,11 @@ class Limiter:
             return False
         self._window_start = start
         self._window_count = count
-        log.info(f"window: restored count={count} started_at={start}")
+        self._window_auto_count = min(auto, count)
+        self._window_human_count = min(human, count - self._window_auto_count)
+        log.info(f"window: restored count={count} "
+                 f"(human={self._window_human_count} auto={self._window_auto_count}) "
+                 f"started_at={start}")
         return True
 
     async def acquire(self, lane: str = "human") -> bool:
@@ -619,6 +689,11 @@ class AutoPacer:
         self._metrics = metrics
         self._lock = asyncio.Lock()
         self._next = 0.0  # loop.time() at which the next auto request may go
+        # Number of automation requests currently blocked in gate() — either
+        # holding the lock and re-checking, or queued behind it. Surfaced so the
+        # dashboard/statusline can show traffic held back by pacing (it holds no
+        # concurrency slot, so it is otherwise invisible to the limiter).
+        self._parked = 0
         self.configure(cfg)
 
     def configure(self, cfg: dict[str, Any]) -> None:
@@ -627,6 +702,14 @@ class AutoPacer:
         self._floor = max(0.0, float(cfg.get("human_quota_floor", 0)))
         self._assumed = max(0.1, float(cfg.get("auto_assumed_request_seconds", 30.0)))
         self._poll = max(0.05, float(cfg.get("auto_poll_seconds", 1.0)))
+        # Cap on how far ahead the measured human rate is projected when
+        # reserving quota (see _usable_and_rate). Falls back to the measurement
+        # horizon so the two default together.
+        self._lookahead = max(
+            1.0,
+            float(cfg.get("human_demand_lookahead_seconds",
+                          cfg.get("human_demand_horizon_seconds", 3600))),
+        )
 
     def _usable_and_rate(self) -> tuple[float, float]:
         """Return (usable_requests, target_rate_per_sec) for automation now."""
@@ -639,7 +722,11 @@ class AutoPacer:
             return 1.0, float("inf")  # window about to roll; drain freely
         limit = float(snap["limit"])
         used = float(snap["count"])
-        expected_human = self._safety * self._limiter.human_rate() * remaining
+        # Project the measured human rate forward only up to _lookahead, not
+        # across the whole (possibly multi-hour) remaining window — otherwise a
+        # small human rate reserves nearly the entire quota on a long window.
+        horizon = min(remaining, self._lookahead)
+        expected_human = self._safety * self._limiter.human_rate() * horizon
         usable = limit - used - expected_human - self._floor
         if usable <= 0:
             return usable, 0.0
@@ -653,24 +740,81 @@ class AutoPacer:
         """Block until the calling automation request may proceed."""
         if not self._enabled:
             return
-        async with self._lock:
-            while True:
-                usable, rate = self._usable_and_rate()
-                if usable <= 0 or rate <= 0:
-                    # Would eat into predicted human demand — park and re-check.
-                    await asyncio.sleep(self._poll)
-                    continue
-                if rate == float("inf"):
+        self._parked += 1
+        try:
+            async with self._lock:
+                while True:
+                    usable, rate = self._usable_and_rate()
+                    if usable <= 0 or rate <= 0:
+                        # Would eat into predicted human demand — park and
+                        # re-check. Drop any stale schedule so a later rate jump
+                        # isn't held behind it.
+                        self._next = 0.0
+                        await asyncio.sleep(self._poll)
+                        continue
+                    if rate == float("inf"):
+                        self._next = 0.0
+                        return
+                    now = asyncio.get_event_loop().time()
+                    interval = 1.0 / rate
+                    if self._next < now:
+                        self._next = now
+                    # Never sit more than one *current* interval ahead. Without
+                    # this, a slow rate (e.g. a 5h LOW window) pushes _next far
+                    # into the future; when the window/tier then changes and the
+                    # rate jumps, parked requests would still be stuck behind the
+                    # old schedule. Clamping re-anchors them to the new rate.
+                    self._next = min(self._next, now + interval)
+                    wait = self._next - now
+                    if wait > 0:
+                        await asyncio.sleep(min(wait, self._poll))
+                        continue
+                    self._next += interval
                     return
-                now = asyncio.get_event_loop().time()
-                if self._next < now:
-                    self._next = now
-                wait = self._next - now
-                if wait > 0:
-                    await asyncio.sleep(min(wait, self._poll))
-                    continue
-                self._next += 1.0 / rate
-                return
+        finally:
+            self._parked -= 1
+
+    def status(self) -> dict[str, Any]:
+        """Current pacing state for the dashboard / statusline.
+
+        `parked` is how many automation requests are held in gate() right now.
+        `next_seconds` is the wait until the next one may go (None when parked on
+        human-reserved quota — that releases when the window advances/resets, not
+        on a fixed timer). `reason` is one of disabled/open/paced/reserved.
+        """
+        snap = self._limiter.window_snapshot()
+        count_auto = float(snap.get("count_auto", 0) or 0)
+        if not self._enabled:
+            return {"enabled": False, "parked": self._parked, "usable": None,
+                    "rate_per_min": None, "next_seconds": None, "reason": "disabled",
+                    "count_auto": round(count_auto, 2), "projected_auto": round(count_auto, 2)}
+        usable, rate = self._usable_and_rate()
+        inf = rate == float("inf")
+        if usable <= 0 or rate <= 0:
+            reason, next_s, rpm = "reserved", None, 0.0
+        elif inf:
+            reason, next_s, rpm = "open", 0.0, None
+        else:
+            now = asyncio.get_event_loop().time()
+            reason = "paced"
+            next_s = max(0.0, self._next - now) if self._parked else 0.0
+            rpm = round(rate * 60.0, 2)
+        # Estimated background total by window end = spent so far + remaining
+        # usable budget (only when there's a real active window to project into).
+        if snap.get("active") and reason in ("paced", "reserved"):
+            projected_auto = count_auto + max(0.0, usable)
+        else:
+            projected_auto = count_auto
+        return {
+            "enabled": True,
+            "parked": self._parked,
+            "usable": round(usable, 2),
+            "rate_per_min": rpm,
+            "next_seconds": round(next_s, 1) if next_s is not None else None,
+            "reason": reason,
+            "count_auto": round(count_auto, 2),
+            "projected_auto": round(projected_auto, 2),
+        }
 
 
 # ---------- Metrics ----------
@@ -2073,7 +2217,26 @@ async function tick() {
       <div class="stat">
         <div class="label">Lanes · human / auto</div>
         <div class="value">${lanes.human.in_flight} / ${lanes.auto.in_flight}</div>
-        <div class="sub">${autoQ > 0 ? autoQ + " auto paced · " : ""}human ~${lanes.human_rate_per_min}/min${lanes.auto.concurrency_reserve ? " · reserve " + lanes.auto.concurrency_reserve : ""}</div>
+        <div class="sub">${autoQ > 0 ? autoQ + " awaiting slot · " : ""}human ~${lanes.human_rate_per_min}/min${lanes.auto.concurrency_reserve ? " · reserve " + lanes.auto.concurrency_reserve : ""}</div>
+      </div>`;
+
+    // Automation pacing: requests held in the pacer (no slot yet) + when the
+    // next one is due. "reserved" = parked because the rest of the window is
+    // statistically kept for humans (releases when the window advances/resets).
+    const P = m.pacer || {enabled:true, parked:0, reason:"open", next_seconds:null, rate_per_min:null};
+    const paceVal = P.parked > 0 ? P.parked + " held" : (P.enabled ? "clear" : "off");
+    const paceClass = P.parked > 0 ? (P.reason === "reserved" ? "warn" : "") : "";
+    let paceSub;
+    if (!P.enabled) paceSub = "pacing disabled";
+    else if (P.reason === "reserved") paceSub = "reserved for humans · waits for window";
+    else if (P.next_seconds != null && P.next_seconds >= 0.05) paceSub = "next in " + fmtSpan(P.next_seconds);
+    else paceSub = P.parked > 0 ? "releasing now" : "idle";
+    if (P.rate_per_min != null) paceSub += " · " + P.rate_per_min + "/min budget";
+    const paceCard = `
+      <div class="stat">
+        <div class="label">Auto Pacing</div>
+        <div class="value ${paceClass}">${paceVal}</div>
+        <div class="sub">${paceSub}</div>
       </div>`;
 
     let winCard;
@@ -2089,11 +2252,16 @@ async function tick() {
       const timePct = pct(W.elapsed_seconds, W.window_seconds);
       const usePct = pct(W.count, W.limit);
       const useClass = usePct >= 95 ? "crit" : usePct >= 80 ? "warn" : "";
+      // Split + end-of-window estimate: human "so far → projected", background
+      // (auto) "so far → projected" (projected_auto comes from the pacer).
+      const ch = W.count_human ?? 0, ca = W.count_auto ?? 0;
+      const ph = W.projected_human ?? ch, pa = P.projected_auto ?? ca;
       winCard = `
         <div class="stat">
           <div class="label">${winLabel}</div>
           <div class="value ${useClass}">${W.count} / ${W.limit}</div>
           <div class="sub">${fmtSpan(W.elapsed_seconds)} in · ${fmtSpan(W.remaining_seconds)} left</div>
+          <div class="sub">human ${ch}→~${ph} · auto ${ca}→~${pa}</div>
           <div class="bar"><i class="${useClass}" style="width:${timePct.toFixed(1)}%"></i></div>
         </div>`;
     }
@@ -2115,6 +2283,7 @@ async function tick() {
         <div class="sub">${L.queued > 0 ? "waiting for slot" : "idle"}</div>
       </div>
       ${laneCard}
+      ${paceCard}
       ${winCard}
       <div class="stat">
         <div class="label">Lifetime</div>
@@ -2291,6 +2460,7 @@ async def metrics_endpoint():
     return {
         "upstream": config["upstream_base_url"],
         "limiter": limiter.snapshot(),
+        "pacer": pacer.status(),
         **metrics.summary(),
         "persistent": pstats.summary(),
     }
@@ -2336,6 +2506,7 @@ async def statusline_endpoint(req: Request):
         window = "1m"
 
     snap = limiter.snapshot()
+    pace = pacer.status()
     summ = metrics.summary()
     tier = snap["active_tier"].upper()
     w = summ["overall"].get(window, {"count": 0, "errors": 0, "avg_seconds": None})
@@ -2383,6 +2554,16 @@ async def statusline_endpoint(req: Request):
         else:
             cs = f"${c:.0f}"
         parts.append(cs)
+    parked = pace.get("parked", 0)
+    if parked > 0:
+        nxt = pace.get("next_seconds")
+        if pace.get("reason") == "reserved":
+            held = f"⏸{parked}"  # paused: quota reserved for humans
+        elif nxt is not None and nxt >= 0.05:
+            held = f"⏳{parked}→{_fmt_dur_short(nxt)}"
+        else:
+            held = f"⏳{parked}"
+        parts.append(color(held, "yellow"))
     if w["errors"] > 0:
         parts.append(color(f"!{w['errors']}err", err_color))
     if snap.get("probe_in_flight"):
@@ -2514,7 +2695,7 @@ async def proxy(full_path: str, request: Request):
     # when the window is nearly spent; it holds no concurrency slot meanwhile.)
     if lane == "auto":
         await pacer.gate()
-    limiter.note_request(model)
+    noted_weight, noted_token = limiter.note_request(model, lane)
 
     finished = False
     handed_off = False
@@ -2523,6 +2704,11 @@ async def proxy(full_path: str, request: Request):
         nonlocal finished
         if not finished:
             finished = True
+            # Window counts requests that actually consumed upstream quota: a
+            # request that ultimately failed (rate-limited out / connection
+            # error / client abort) is taken back off the window count.
+            if not (200 <= status < 400):
+                limiter.discount_request(noted_weight, noted_token, lane)
             metrics.request_finished(model, started_at, status, usage)
 
     try:

@@ -23,7 +23,8 @@ throttle_listen_port: 8788
 
 # --- Automation-lane pacing ---
 # The pacer admits automation at rate = usable / time_left, where
-#   usable = window_limit - used - human_demand_safety * human_rate * time_left
+#   usable = window_limit - used
+#            - human_demand_safety * human_rate * min(time_left, lookahead)
 #            - human_quota_floor
 # so it holds back what humans are *statistically predicted* to still need. As
 # the window nears its end that prediction term shrinks to ~0, letting
@@ -33,6 +34,8 @@ throttle_listen_port: 8788
 auto_pacing_enabled: true
 human_demand_safety: 1.5            # >1 leaves more headroom for humans (slower auto)
 human_demand_horizon_seconds: 3600  # window over which the human request rate is measured
+human_demand_lookahead_seconds: 3600  # cap on how far ahead that rate is projected when reserving quota
+                                      # (keeps a long e.g. 5h window from reserving nearly all quota off a small human rate)
 human_quota_floor: 0                # hard floor of requests always kept free for humans (0 = purely statistical)
 auto_concurrency_reserve: 0         # slots reserved for humans (auto capped at max_concurrent - this; 0 = rely on priority)
 auto_assumed_request_seconds: 30.0  # avg request time assumed before any latency is measured
