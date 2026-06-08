@@ -1,6 +1,6 @@
 # anthropic_proxy config — edit and save; the proxy hot-reloads.
-# Hot-reloadable: tiers, force_tier, log_level, retry_*, upstream_timeout,
-#                 promotion_cooldown_seconds, config_poll_seconds.
+# Hot-reloadable: tiers, force_tier, scheduled_high_at, scheduled_low_at, log_level, retry_*,
+#                 upstream_timeout, promotion_cooldown_seconds, config_poll_seconds.
 # Restart required: upstream_base_url, listen_host, listen_port.
 
 # Where to forward requests. Set this to your custom service. Every path/header
@@ -48,6 +48,29 @@ initial_tier: "low"   # "low" | "high"
 # Manual override. null = auto-detect (recommended). Set to "low" or "high" to
 # pin a specific tier and disable auto-tier switching.
 force_tier: null
+
+# Optional RECURRING DAILY automatic LOW->HIGH switch. Accepts unix epoch
+# seconds, "HH:MM" / "HH:MM:SS", or an ISO-8601 datetime — only the local
+# time-of-day matters, and the switch fires at that time EVERY DAY. At each fire
+# the tier promotes to HIGH (auto-demotes on the next rate-limit, like a boost —
+# use force_tier to pin instead). Before it fires, the pacer treats the current
+# LOW window as ending at the switch time, so background traffic drains the
+# leftover over the shorter horizon. null = no daily switch.
+#
+# A separate ONE-SHOT switch (fires once, then clears) is available at runtime and
+# is independent of this daily one — the proxy acts on whichever comes first:
+#   curl -X POST localhost:8787/_proxy/schedule_high -d '{"at": "14:30"}'   # arm one-shot
+#   curl -X POST localhost:8787/_proxy/schedule_high -d '{"at": null}'      # clear one-shot
+scheduled_high_at: null
+
+# Optional RECURRING DAILY automatic HIGH->LOW switch — the mirror of
+# scheduled_high_at. Same value formats; at that local time-of-day the tier drops
+# to LOW every day. Pair it with scheduled_high_at to run HIGH during a daily
+# window and LOW the rest of the day. null = no daily switch. A separate ONE-SHOT
+# switch is available at runtime, independent of this daily one:
+#   curl -X POST localhost:8787/_proxy/schedule_low -d '{"at": "09:00"}'    # arm one-shot
+#   curl -X POST localhost:8787/_proxy/schedule_low -d '{"at": null}'       # clear one-shot
+scheduled_low_at: null
 
 # The two tiers — each has a max concurrency cap plus its own rolling
 # request-quota window (window_limit requests per window_seconds). There is no

@@ -63,29 +63,62 @@ exact line numbers are deliberately omitted since they drift on every edit.
     HIGH→LOW.
   - `boost_high()`: manual temporary jump to HIGH (auto-demotes on the next
     rate-limit). Distinct from `force_tier` which pins a tier.
+  - `set_daily_switch()` / `set_oneshot_switch()` (LOW→HIGH) +
+    `set_daily_low_switch()` / `set_oneshot_low_switch()` (HIGH→LOW) /
+    `scheduled_switch_at()` / `scheduled_low_switch_at()` /
+    `apply_scheduled_switch()` / `schedule_snapshot()`: scheduled tier switches.
+    **Each direction** has two independent slots — a **recurring daily** one from
+    config (`scheduled_high_at` / `scheduled_low_at`, fires at a local
+    time-of-day every day, re-arming itself) and a **one-shot** one from the API
+    (`POST /_proxy/schedule_high` / `POST /_proxy/schedule_low`, fires once then
+    clears). `scheduled_switch_at()` / `scheduled_low_switch_at()` each return the
+    earlier of their two slots. The background `config_watch_loop` polls
+    `apply_scheduled_switch()` which, once any slot is due (and not blocked by
+    `force_tier`), switches the tier + restarts the window (re-arming daily /
+    clearing one-shot); if both directions fire in the same tick the later-scheduled
+    one wins. Before a LOW→HIGH switch fires the pacer reads `scheduled_switch_at`
+    to end the current LOW window early (the HIGH→LOW slot does not feed the pacer).
+    `parse_switch_time()` resolves unix seconds / `HH:MM` / ISO-8601 to an
+    absolute timestamp; `_next_time_of_day()` + `_local_tod_seconds()` drive the
+    daily recurrence.
   - `_restart_window()`: called on **every tier change** (promotion, demotion,
     boost, or a forced config switch) — resets the count + timer so the window
     re-anchors under the new active tier's limit/duration.
-  - `note_request()` / `discount_request()` / `_window_snapshot()` /
-    `window_snapshot()`: track the rolling request-quota **window** for the
-    *active* tier (dashboard "X / N this window" indicator — tracked, NOT
-    enforced), including per-model `model_window_weights`. `note_request(model,
-    lane)` returns `(weight, window_token)` and also folds the weight into a
-    per-lane split (`_window_human_count` / `_window_auto_count`, invariant: they
-    sum to `_window_count`); the snapshot exposes `count_human` / `count_auto`
-    plus a `projected_human` end-of-window estimate (`count_human +
-    human_rate·remaining`). `discount_request(weight, token, lane)` reverses both
-    the total and the lane count when a request ultimately fails (so the window
-    counts only quota that was actually consumed), no-op if the window has since
-    rolled. The split is persisted in `window.json` and restored on boot.
+  - `note_request()` / `note_done()` / `discount_request()` /
+    `_window_snapshot()` / `window_snapshot()`: track the rolling request-quota
+    **window** for the *active* tier (dashboard "X / N this window" indicator —
+    tracked, NOT enforced), including per-model `model_window_weights`.
+    `note_request(model, lane)` returns `(weight, window_token)` and also folds
+    the weight into a per-lane split (`_window_human_count` /
+    `_window_auto_count`, invariant: they sum to `_window_count`); the snapshot
+    exposes `count_human` / `count_auto` plus a `projected_human` end-of-window
+    estimate (`count_human + human_rate·remaining`). `discount_request(weight,
+    token, lane)` reverses both the total and the lane count when a request
+    ultimately fails (so the window counts only quota that was actually
+    consumed), no-op if the window has since rolled. `note_request` also adds the
+    weight to an **in-flight accumulator** (`_inflight_weight` + lane split);
+    `note_done(weight, lane)` — called once per request by the handler's
+    `finalize` on any outcome — removes it. `_restart_window` **re-seeds** the
+    fresh window from this in-flight tally, so a window restart mid-flight (e.g. a
+    probe-driven LOW→HIGH promotion) keeps requests already running counted under
+    the new tier instead of zeroing them out of the indicator. The split is
+    persisted in `window.json` and restored on boot; the in-flight tally is
+    ephemeral (no request survives a restart).
   - `_note_human()` / `human_rate()`: track human arrivals (a `deque` over
     `human_demand_horizon`) and report a horizon-averaged rate for the pacer.
   - `set_window_count()` / `set_window_start()`: manual overrides behind the
     `/_proxy/window/*` endpoints.
   - `window_state()` / `load_window_state()`: serialize / restore the window for
     `window.json` persistence; a restored window is discarded if already elapsed.
-  - `snapshot()`: the JSON state (incl. per-lane in-flight/queued + human rate)
-    used by dashboard/statusline.
+  - `enter_rl_wait()` / `leave_rl_wait()`: bump a **rate-limit retry-backoff
+    gauge** (`_rl_waiting` + per-lane), bracketed by the proxy handler around the
+    429/503/529 backoff sleep. A request waiting out upstream pushback holds no
+    slot and isn't a `waiter`, so without this gauge it's invisible on the
+    dashboard while the client is actually waiting. `release_rate_limited` also
+    stamps `_last_rate_limited_at` (wall-clock) for an "upstream limiting us"
+    indicator.
+  - `snapshot()`: the JSON state (incl. per-lane in-flight/queued + human rate +
+    `rate_limited_waiting` / `last_rate_limited_at`) used by dashboard/statusline.
 
 ### Automation-lane pacing
 - `AutoPacer`: paces the `"auto"` lane so it spends only the *leftover* quota.
@@ -94,8 +127,10 @@ exact line numbers are deliberately omitted since they drift on every edit.
   lookahead) − floor` and a target rate `usable/time_left`, capped by
   `max_concurrent/avg_request_time`. The `min(…, lookahead)`
   (`human_demand_lookahead_seconds`) stops a long (e.g. 5h LOW) window from
-  reserving nearly all quota off a small human rate. Near window end the
-  predicted-human term vanishes so auto can drain ~100%; if humans already spent
+  reserving nearly all quota off a small human rate. A pending scheduled LOW→HIGH
+  switch (`limiter.scheduled_switch_at()`) caps the effective `remaining` at the
+  switch time, so the LOW leftover drains over the shorter horizon. Near window
+  end the predicted-human term vanishes so auto can drain ~100%; if humans already spent
   the window, `usable ≤ 0` and auto parks. `gate()` clamps its internal `_next`
   schedule to at most one *current* interval ahead, so a rate jump (window/tier
   change) releases parked requests immediately instead of stranding them behind a
@@ -164,7 +199,11 @@ exact line numbers are deliberately omitted since they drift on every edit.
 - `GET /_proxy/series` — graph data. `GET /_proxy/status` — limiter snapshot.
 - `GET /_proxy/statusline` — compact `plain|tmux|ansi` status line.
 - `GET /_proxy/config` — effective config. `POST /_proxy/force_tier`,
-  `POST /_proxy/boost` — runtime tier control.
+  `POST /_proxy/boost` — runtime tier control. `POST /_proxy/schedule_high` /
+  `POST /_proxy/schedule_low` (`{"at": <unix|"HH:MM"|ISO|null>}`) — arm/clear the
+  **one-shot** scheduled LOW→HIGH / HIGH→LOW switch (the recurring **daily** ones
+  are the `scheduled_high_at` / `scheduled_low_at` config keys; all four slots are
+  independent).
 - `POST /_proxy/window/count` — set the active window's request count
   (`{"count": N}`). `POST /_proxy/window/start` — set/clear its start time
   (`{"started_at": <unix seconds>|null}`). Both persist to `window.json`
@@ -184,7 +223,10 @@ exact line numbers are deliberately omitted since they drift on every edit.
      - **Connection errors** retry up to `retry_max_attempts`.
      - **429/503/529** retry against a wall-clock budget
        (`retry_max_elapsed_seconds`) so a queued request can outlast a full quota
-       window and run once quota resets.
+       window and run once quota resets. The backoff sleep is bracketed by
+       `limiter.enter_rl_wait()` / `leave_rl_wait()` so the parked request shows
+       up on the dashboard ("Waiting on 429" / statusline `⏳429×N`) instead of
+       being invisible (it holds no slot and isn't a `waiter` while backing off).
   4. On success, hand back a `StreamingResponse` whose `body_stream()` tees bytes
      through the usage extractor, then `release_*(was_probe, lane)` and finalizes
      metrics in its `finally`.

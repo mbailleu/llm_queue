@@ -79,6 +79,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_poll_seconds": 1.0,
     "initial_tier": "low",
     "force_tier": None,
+    # Optional RECURRING DAILY automatic LOW->HIGH switch. Accepts unix epoch
+    # seconds, "HH:MM"/"HH:MM:SS", or an ISO-8601 datetime — only the local
+    # time-of-day is used, and the switch fires at that time every day. The tier
+    # is promoted to HIGH (auto-demotes on the next rate-limit, like a boost — use
+    # force_tier to pin instead). Before each fire, the pacer treats the current
+    # LOW window as ending at the switch time, so background traffic drains the
+    # leftover over the shorter horizon. null = no daily switch. Hot-reloadable.
+    # A separate ONE-SHOT switch is available via
+    # POST /_proxy/schedule_high {"at": ...}; the two are independent.
+    "scheduled_high_at": None,
+    # Optional RECURRING DAILY automatic HIGH->LOW switch — the mirror of
+    # scheduled_high_at. Same value formats (unix seconds, "HH:MM[:SS]", ISO-8601;
+    # only the local time-of-day is used). At that time the tier drops to LOW
+    # every day. A separate ONE-SHOT switch is available via
+    # POST /_proxy/schedule_low {"at": ...}. null = no daily switch. Hot-reloadable.
+    "scheduled_low_at": None,
     # Each tier has a max concurrency cap and its own rolling request-quota
     # window (window_limit requests per window_seconds). The active tier's window
     # drives the dashboard indicator and restarts whenever the tier switches.
@@ -178,6 +194,25 @@ class Limiter:
             self._active = self._low if self._forced == "low" else self._high
         self._promotion_cooldown = promotion_cooldown
         self._last_demotion = 0.0
+        # Optional scheduled automatic tier switches. Each direction (LOW->HIGH
+        # and HIGH->LOW) has two independent slots:
+        #  - a recurring DAILY switch from config (`scheduled_high_at` /
+        #    `scheduled_low_at`): fires at a local time-of-day every day, re-arming
+        #    itself after each fire.
+        #  - a ONE-SHOT switch from the API (`POST /_proxy/schedule_high` /
+        #    `POST /_proxy/schedule_low`): fires once at an absolute time, then
+        #    clears.
+        # For each direction the effective next switch is whichever comes first.
+        # Before a LOW->HIGH switch fires the pacer treats the current LOW window
+        # as ending then, so auto drains the leftover over the shorter horizon.
+        # None/None = no scheduled switch.
+        self._switch_daily_tod: float | None = None    # seconds since local midnight
+        self._switch_daily_next: float | None = None   # absolute unix of next daily fire
+        self._switch_once_at: float | None = None       # absolute unix of one-shot fire
+        # HIGH->LOW counterparts.
+        self._switch_low_daily_tod: float | None = None
+        self._switch_low_daily_next: float | None = None
+        self._switch_low_once_at: float | None = None
         self._in_flight = 0
         self._waiters = 0
         self._probe_in_flight = False
@@ -191,6 +226,17 @@ class Limiter:
         self._human_waiters = 0
         self._auto_waiters = 0
         self._auto_concurrency_reserve = 0
+        # Requests currently parked in retry backoff after upstream pushback
+        # (429/503/529 — e.g. the backend's own quota limit, which the proxy does
+        # not enforce but does wait out). These hold no concurrency slot and are
+        # not `waiters`, so without this gauge they'd be invisible on the
+        # dashboard while the client is, in fact, waiting. Per-lane split + the
+        # unix time of the most recent rate-limit, for an "upstream limiting us"
+        # indicator.
+        self._rl_waiting = 0
+        self._rl_waiting_human = 0
+        self._rl_waiting_auto = 0
+        self._last_rate_limited_at: float | None = None
         # Recent human-request arrival times (monotonic), used to estimate
         # future human demand for the pacer. Trimmed to _human_horizon.
         self._human_times: deque[float] = deque()
@@ -210,6 +256,16 @@ class Limiter:
         # (both move together with note_request / discount_request / restart).
         self._window_human_count = 0.0
         self._window_auto_count = 0.0
+        # Weight of requests that have been noted against the window but not yet
+        # finalized ("in flight" for accounting). Used to re-seed the count when
+        # the window restarts mid-flight (e.g. a probe-driven tier switch), so
+        # requests already running aren't erased from the indicator and silently
+        # uncounted for the rest of their life. note_request adds, note_done
+        # subtracts; the lane split mirrors the window split. Not persisted (no
+        # request survives a process restart).
+        self._inflight_weight = 0.0
+        self._inflight_weight_human = 0.0
+        self._inflight_weight_auto = 0.0
         # Per-model window weighting. Each entry maps a model (matched exactly,
         # then by substring) to how many "requests" it costs the window count.
         self._window_weights: dict[str, float] = dict(window_weights or {})
@@ -240,14 +296,24 @@ class Limiter:
         """Restart the rolling quota window for the (new) active tier.
 
         Called on every tier change (promotion, demotion, boost, or a forced
-        switch) so the count and timer reset and the next request re-anchors a
-        fresh window under the new tier's limit/duration. Synchronous and
-        await-free; callers already hold `self._cond`.
+        switch) so the timer resets and the window re-anchors under the new
+        tier's limit/duration. Requests still in flight are carried forward (they
+        keep consuming quota under the new tier, so they must stay counted) — only
+        their contribution survives; the window otherwise starts empty. Anchors a
+        fresh start now when anything is in flight, else leaves the window dormant
+        for the next request to anchor. Synchronous and await-free; callers
+        already hold `self._cond`.
         """
-        self._window_start = None
-        self._window_count = 0.0
-        self._window_human_count = 0.0
-        self._window_auto_count = 0.0
+        if self._inflight_weight > 0:
+            self._window_start = time.time()
+            self._window_count = self._inflight_weight
+            self._window_human_count = self._inflight_weight_human
+            self._window_auto_count = self._inflight_weight_auto
+        else:
+            self._window_start = None
+            self._window_count = 0.0
+            self._window_human_count = 0.0
+            self._window_auto_count = 0.0
 
     def note_request(self, model: str = "", lane: str = "human") -> tuple[float, float]:
         """Count one client request against the rolling quota window.
@@ -265,18 +331,40 @@ class Limiter:
         """
         now = time.time()
         window_seconds = float(self._active.window_seconds)
-        if self._window_start is None or now - self._window_start >= window_seconds:
-            self._window_start = now
-            self._window_count = 0.0
-            self._window_human_count = 0.0
-            self._window_auto_count = 0.0
         weight = self._window_weight_for(model)
+        if self._window_start is None or now - self._window_start >= window_seconds:
+            # Fresh window: carry forward requests already in flight (they spill
+            # into this window and keep consuming its quota). This request's own
+            # weight is added below, after it joins the in-flight set.
+            self._window_start = now
+            self._window_count = self._inflight_weight
+            self._window_human_count = self._inflight_weight_human
+            self._window_auto_count = self._inflight_weight_auto
         self._window_count += weight
+        self._inflight_weight += weight
         if lane == "auto":
             self._window_auto_count += weight
+            self._inflight_weight_auto += weight
         else:
             self._window_human_count += weight
+            self._inflight_weight_human += weight
         return weight, self._window_start
+
+    def note_done(self, weight: float, lane: str = "human") -> None:
+        """Drop a noted request from the in-flight set once it has finalized.
+
+        Called exactly once per request in `note_request`'s wake (on any outcome),
+        so the in-flight accumulator that `_restart_window` carries forward only
+        reflects requests still running. Independent of `discount_request` (which
+        reverses the *window* count for failed requests); this only touches the
+        in-flight tally and never the window. Synchronous and await-free.
+        """
+        weight = max(0.0, float(weight))
+        self._inflight_weight = max(0.0, self._inflight_weight - weight)
+        if lane == "auto":
+            self._inflight_weight_auto = max(0.0, self._inflight_weight_auto - weight)
+        else:
+            self._inflight_weight_human = max(0.0, self._inflight_weight_human - weight)
 
     def discount_request(self, weight: float, window_token: float | None,
                          lane: str = "human") -> None:
@@ -535,6 +623,26 @@ class Limiter:
         self._auto_concurrency_reserve = max(0, int(concurrency_reserve))
         self._human_horizon = max(1.0, float(human_horizon))
 
+    # -- rate-limit retry-backoff gauge (a request waiting out upstream
+    #    pushback holds no slot and is not a waiter, so track it explicitly).
+    #    Sync + await-free: atomic under the single-threaded loop. --
+
+    def enter_rl_wait(self, lane: str = "human") -> None:
+        """Mark a request as parked in retry backoff after upstream rate-limited it."""
+        self._rl_waiting += 1
+        if lane == "auto":
+            self._rl_waiting_auto += 1
+        else:
+            self._rl_waiting_human += 1
+
+    def leave_rl_wait(self, lane: str = "human") -> None:
+        """Clear the backoff mark once the request retries or gives up."""
+        self._rl_waiting = max(0, self._rl_waiting - 1)
+        if lane == "auto":
+            self._rl_waiting_auto = max(0, self._rl_waiting_auto - 1)
+        else:
+            self._rl_waiting_human = max(0, self._rl_waiting_human - 1)
+
     async def release_success(self, was_probe: bool, lane: str = "human") -> None:
         async with self._cond:
             self._release_slot(lane)
@@ -554,6 +662,7 @@ class Limiter:
         async with self._cond:
             self._release_slot(lane)
             self._n_rate_limited += 1
+            self._last_rate_limited_at = time.time()
             now = time.monotonic()
             if was_probe:
                 self._probe_in_flight = False
@@ -601,6 +710,154 @@ class Limiter:
             self._cond.notify_all()
             return True
 
+    # -- scheduled tier switches (daily from config + one-shot from API) --
+    #    LOW->HIGH (set_daily_switch/set_oneshot_switch) and the HIGH->LOW
+    #    counterparts (set_daily_low_switch/set_oneshot_low_switch).
+
+    def set_daily_switch(self, ts: float | None) -> dict[str, Any]:
+        """Arm (or clear) the recurring DAILY LOW->HIGH switch from `ts`.
+
+        Only `ts`'s local time-of-day matters; the switch then fires at that time
+        every day (re-arming after each fire). `None` clears it. Sync +
+        await-free. Returns the schedule snapshot.
+        """
+        if ts is None:
+            self._switch_daily_tod = None
+            self._switch_daily_next = None
+        else:
+            self._switch_daily_tod = _local_tod_seconds(float(ts))
+            self._switch_daily_next = _next_time_of_day(self._switch_daily_tod, time.time())
+        return self.schedule_snapshot()
+
+    def set_oneshot_switch(self, ts: float | None) -> dict[str, Any]:
+        """Arm (or clear) the ONE-SHOT LOW->HIGH switch at absolute unix `ts`.
+
+        Independent of the daily switch; fires once then clears. Sync +
+        await-free. Returns the schedule snapshot.
+        """
+        self._switch_once_at = float(ts) if ts is not None else None
+        return self.schedule_snapshot()
+
+    def set_daily_low_switch(self, ts: float | None) -> dict[str, Any]:
+        """Arm (or clear) the recurring DAILY HIGH->LOW switch from `ts`.
+
+        Mirror of `set_daily_switch` for the demotion direction.
+        """
+        if ts is None:
+            self._switch_low_daily_tod = None
+            self._switch_low_daily_next = None
+        else:
+            self._switch_low_daily_tod = _local_tod_seconds(float(ts))
+            self._switch_low_daily_next = _next_time_of_day(self._switch_low_daily_tod, time.time())
+        return self.schedule_snapshot()
+
+    def set_oneshot_low_switch(self, ts: float | None) -> dict[str, Any]:
+        """Arm (or clear) the ONE-SHOT HIGH->LOW switch at absolute unix `ts`.
+
+        Mirror of `set_oneshot_switch` for the demotion direction.
+        """
+        self._switch_low_once_at = float(ts) if ts is not None else None
+        return self.schedule_snapshot()
+
+    def scheduled_switch_at(self) -> float | None:
+        """Absolute unix time of the next pending LOW->HIGH switch (the earlier of
+        the daily and one-shot slots), or None. Read by the pacer to shorten the
+        effective window when the switch ends it early."""
+        cands = [t for t in (self._switch_daily_next, self._switch_once_at) if t is not None]
+        return min(cands) if cands else None
+
+    def scheduled_low_switch_at(self) -> float | None:
+        """Absolute unix time of the next pending HIGH->LOW switch, or None."""
+        cands = [t for t in (self._switch_low_daily_next, self._switch_low_once_at) if t is not None]
+        return min(cands) if cands else None
+
+    @staticmethod
+    def _fmt_tod(tod: float | None) -> str | None:
+        if tod is None:
+            return None
+        tod = int(tod)
+        h, m, s = tod // 3600, (tod % 3600) // 60, tod % 60
+        return f"{h:02d}:{m:02d}" + (f":{s:02d}" if s else "")
+
+    def schedule_snapshot(self) -> dict[str, Any]:
+        now = time.time()
+        eff_h = self.scheduled_switch_at()
+        eff_l = self.scheduled_low_switch_at()
+        recurring_h = (
+            self._switch_daily_next is not None
+            and (self._switch_once_at is None or self._switch_daily_next <= self._switch_once_at)
+        )
+        recurring_l = (
+            self._switch_low_daily_next is not None
+            and (self._switch_low_once_at is None or self._switch_low_daily_next <= self._switch_low_once_at)
+        )
+        return {
+            "switch_high_at": eff_h,
+            "seconds_until": (eff_h - now) if eff_h is not None else None,
+            "pending": eff_h is not None and eff_h > now,
+            "recurring": recurring_h,
+            "daily_at": self._fmt_tod(self._switch_daily_tod),
+            "oneshot_at": self._switch_once_at,
+            "switch_low_at": eff_l,
+            "low_seconds_until": (eff_l - now) if eff_l is not None else None,
+            "low_pending": eff_l is not None and eff_l > now,
+            "low_recurring": recurring_l,
+            "low_daily_at": self._fmt_tod(self._switch_low_daily_tod),
+            "low_oneshot_at": self._switch_low_once_at,
+        }
+
+    async def apply_scheduled_switch(self) -> bool:
+        """Apply any scheduled tier switch (LOW->HIGH or HIGH->LOW) now due.
+
+        One-shot slots clear once reached; daily slots re-arm to the next day.
+        Skipped (slots left pending) while a `force_tier` pins the tier. Restarts
+        the quota window under the new tier like any other switch. If both
+        directions are due in the same tick (unusual), the one scheduled later
+        wins. Returns True if any slot fired.
+        """
+        async with self._cond:
+            if self._forced is not None:
+                return False  # pinned tier wins; re-check once force is cleared
+            now = time.time()
+            high_at: float | None = None  # fire time of a due LOW->HIGH switch
+            low_at: float | None = None   # fire time of a due HIGH->LOW switch
+            if self._switch_once_at is not None and now >= self._switch_once_at:
+                high_at = self._switch_once_at
+                self._switch_once_at = None
+            if self._switch_daily_next is not None and now >= self._switch_daily_next:
+                high_at = self._switch_daily_next if high_at is None else max(high_at, self._switch_daily_next)
+                self._switch_daily_next = _next_time_of_day(self._switch_daily_tod, now)
+            if self._switch_low_once_at is not None and now >= self._switch_low_once_at:
+                low_at = self._switch_low_once_at
+                self._switch_low_once_at = None
+            if self._switch_low_daily_next is not None and now >= self._switch_low_daily_next:
+                low_at = self._switch_low_daily_next if low_at is None else max(low_at, self._switch_low_daily_next)
+                self._switch_low_daily_next = _next_time_of_day(self._switch_low_daily_tod, now)
+            if high_at is None and low_at is None:
+                return False
+            # If both directions are due, honor whichever was scheduled later.
+            if high_at is not None and low_at is not None:
+                go_high = high_at >= low_at
+            else:
+                go_high = high_at is not None
+            target = self._high if go_high else self._low
+            if self._active is not target:
+                self._active = target
+                if go_high:
+                    self._n_promotions += 1
+                else:
+                    self._n_demotions += 1
+                self._restart_window()
+                arrow = "LOW -> HIGH" if go_high else "HIGH -> LOW"
+                tail = ("auto-demotes on rate-limit; " if go_high else "")
+                log.warning(
+                    f"tier switched {arrow} on schedule ({tail}"
+                    f"max_concurrent={target.max_concurrent}, "
+                    f"window={target.window_limit}/{target.window_seconds:.0f}s)"
+                )
+                self._cond.notify_all()
+            return True
+
     async def update_tiers(self, low: Tier, high: Tier,
                            promotion_cooldown: float, forced: str | None,
                            window_weights: dict[str, float] | None = None,
@@ -640,11 +897,16 @@ class Limiter:
             "max_concurrent": self._active.max_concurrent,
             "in_flight": self._in_flight,
             "queued": self._waiters,
+            "rate_limited_waiting": self._rl_waiting,
+            "last_rate_limited_at": self._last_rate_limited_at,
             "probe_in_flight": self._probe_in_flight,
+            "schedule": self.schedule_snapshot(),
             "lanes": {
-                "human": {"in_flight": self._human_in_flight, "queued": self._human_waiters},
+                "human": {"in_flight": self._human_in_flight, "queued": self._human_waiters,
+                          "rate_limited_waiting": self._rl_waiting_human},
                 "auto": {"in_flight": self._auto_in_flight, "queued": self._auto_waiters,
-                         "concurrency_reserve": self._auto_concurrency_reserve},
+                         "concurrency_reserve": self._auto_concurrency_reserve,
+                         "rate_limited_waiting": self._rl_waiting_auto},
                 "human_rate_per_min": round(self.human_rate() * 60.0, 2),
             },
             "window": self._window_snapshot(),
@@ -718,6 +980,14 @@ class AutoPacer:
             # No window open yet — the first request anchors it; let it through.
             return 1.0, float("inf")
         remaining = float(snap["remaining_seconds"] or 0.0)
+        # A scheduled LOW->HIGH switch ends the current LOW window early: pace as
+        # if the window closes at the switch time, so the leftover drains over the
+        # shorter horizon (and the predicted-human term shrinks toward it too).
+        switch_at = self._limiter.scheduled_switch_at()
+        if switch_at is not None and snap.get("tier") == "low":
+            until = switch_at - time.time()
+            if until > 0:  # only a still-future switch ends the window early
+                remaining = min(remaining, until)
         if remaining <= 0:
             return 1.0, float("inf")  # window about to roll; drain freely
         limit = float(snap["limit"])
@@ -1551,6 +1821,74 @@ def parse_window_weights(cfg: dict[str, Any]) -> tuple[dict[str, float], float]:
     return weights, default
 
 
+def _local_tod_seconds(ts: float) -> float:
+    """Seconds since local midnight for an absolute unix timestamp."""
+    import datetime as _dt
+    ln = _dt.datetime.fromtimestamp(ts)
+    return ln.hour * 3600 + ln.minute * 60 + ln.second
+
+
+def _next_time_of_day(tod_seconds: float, now: float) -> float:
+    """Absolute unix of the next local occurrence of `tod_seconds` strictly after
+    `now` (today if still ahead, else tomorrow). DST-safe via the local date."""
+    import datetime as _dt
+    ln = _dt.datetime.fromtimestamp(now)
+    midnight = ln.replace(hour=0, minute=0, second=0, microsecond=0)
+    cand = midnight + _dt.timedelta(seconds=float(tod_seconds))
+    if cand.timestamp() <= now:
+        cand += _dt.timedelta(days=1)
+    return cand.timestamp()
+
+
+def parse_switch_time(value: Any, now: float | None = None) -> float | None:
+    """Resolve a `scheduled_high_at` config/API value to absolute unix seconds.
+
+    Accepts:
+      - None / "" / 0           -> None (no scheduled switch)
+      - a number (or numeric    -> taken as unix epoch seconds
+        string)
+      - "HH:MM" / "HH:MM:SS"     -> the next future occurrence in local time
+      - an ISO-8601 datetime     -> parsed in local time if it has no offset
+        ("YYYY-MM-DDTHH:MM[:SS]")
+
+    Returns None (with a warning) for anything unparseable, so a bad value never
+    arms a switch at a surprising time.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    try:
+        v = float(s)
+        return v if v > 0 else None
+    except ValueError:
+        pass
+    import datetime as _dt
+    now = time.time() if now is None else now
+    local_now = _dt.datetime.fromtimestamp(now)
+    parts = s.split(":")
+    if len(parts) in (2, 3) and all(p.isdigit() for p in parts):
+        hh, mm = int(parts[0]), int(parts[1])
+        ss = int(parts[2]) if len(parts) == 3 else 0
+        if 0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60:
+            cand = local_now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+            if cand.timestamp() <= now:
+                cand += _dt.timedelta(days=1)  # already passed today -> tomorrow
+            return cand.timestamp()
+    try:
+        return _dt.datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        log.warning(f"scheduled_high_at: could not parse {value!r}; ignoring")
+        return None
+
+
 def init_from_config(cfg: dict[str, Any]) -> tuple[Limiter, Metrics, PersistentStats, AutoPacer]:
     forced = cfg.get("force_tier") if cfg.get("force_tier") in ("low", "high") else None
     window_weights, default_window_weight = parse_window_weights(cfg)
@@ -1567,6 +1905,8 @@ def init_from_config(cfg: dict[str, Any]) -> tuple[Limiter, Metrics, PersistentS
         concurrency_reserve=int(cfg.get("auto_concurrency_reserve", 0)),
         human_horizon=float(cfg.get("human_demand_horizon_seconds", 3600)),
     )
+    lim.set_daily_switch(parse_switch_time(cfg.get("scheduled_high_at")))
+    lim.set_daily_low_switch(parse_switch_time(cfg.get("scheduled_low_at")))
     pricing = cfg.get("model_pricing") or {}
     if not isinstance(pricing, dict):
         pricing = {}
@@ -1605,6 +1945,8 @@ async def apply_config_change(new_cfg: dict[str, Any]) -> None:
         concurrency_reserve=int(new_cfg.get("auto_concurrency_reserve", 0)),
         human_horizon=float(new_cfg.get("human_demand_horizon_seconds", 3600)),
     )
+    limiter.set_daily_switch(parse_switch_time(new_cfg.get("scheduled_high_at")))
+    limiter.set_daily_low_switch(parse_switch_time(new_cfg.get("scheduled_low_at")))
     pacer.configure(new_cfg)
     metrics.set_max_age(float(new_cfg["metrics_window_seconds"]))
     new_pricing = new_cfg.get("model_pricing") or {}
@@ -1629,6 +1971,11 @@ async def config_watch_loop() -> None:
                     new_cfg = load_config_file()
                     await apply_config_change(new_cfg)
                     config_mtime = mt
+            # Apply a due scheduled LOW->HIGH switch (one-shot; cheap no-op when
+            # nothing is armed). Polled here so the switch lands within
+            # config_poll_seconds of its target time.
+            if await limiter.apply_scheduled_switch():
+                await asyncio.to_thread(save_window_file)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -2207,6 +2554,11 @@ async function tick() {
     const tierClass = L.active_tier === "high" ? "tier-high" : "tier-low";
     const concPct = pct(L.in_flight, L.max_concurrent);
     const concClass = concPct >= 95 ? "crit" : concPct >= 75 ? "warn" : "";
+    const rlWait = L.rate_limited_waiting || 0;
+    const rlAgo = L.last_rate_limited_at ? ((Date.now()/1000) - L.last_rate_limited_at) : null;
+    const rlSub = rlWait > 0
+      ? "backing off upstream limit"
+      : (rlAgo !== null ? "last 429 " + fmtSpan(rlAgo) + " ago" : "none");
 
     const W = L.window || {active:false};
     const winHrs = (W.window_seconds || 18000) / 3600;
@@ -2270,7 +2622,7 @@ async function tick() {
       <div class="stat">
         <div class="label">Active Tier</div>
         <div class="value ${tierClass}">${L.active_tier.toUpperCase()}</div>
-        <div class="sub">${L.forced_tier ? "forced" : "auto"}${L.probe_in_flight ? " · probing" : ""}</div>
+        <div class="sub">${L.forced_tier ? "forced" : "auto"}${L.probe_in_flight ? " · probing" : ""}${(L.schedule && L.schedule.pending) ? " · ⏰HIGH " + (L.schedule.recurring ? "daily @" + L.schedule.daily_at + " (in " + fmtSpan(L.schedule.seconds_until) + ")" : "in " + fmtSpan(L.schedule.seconds_until)) : ""}${(L.schedule && L.schedule.low_pending) ? " · ⏰LOW " + (L.schedule.low_recurring ? "daily @" + L.schedule.low_daily_at + " (in " + fmtSpan(L.schedule.low_seconds_until) + ")" : "in " + fmtSpan(L.schedule.low_seconds_until)) : ""}</div>
       </div>
       <div class="stat">
         <div class="label">In Flight</div>
@@ -2281,6 +2633,11 @@ async function tick() {
         <div class="label">Queued</div>
         <div class="value">${L.queued}</div>
         <div class="sub">${L.queued > 0 ? "waiting for slot" : "idle"}</div>
+      </div>
+      <div class="stat">
+        <div class="label">Waiting on 429</div>
+        <div class="value ${rlWait > 0 ? "crit" : ""}">${rlWait}</div>
+        <div class="sub">${rlSub}</div>
       </div>
       ${laneCard}
       ${paceCard}
@@ -2564,10 +2921,19 @@ async def statusline_endpoint(req: Request):
         else:
             held = f"⏳{parked}"
         parts.append(color(held, "yellow"))
+    rl_wait = snap.get("rate_limited_waiting", 0)
+    if rl_wait > 0:
+        # Requests waiting out upstream rate-limiting (e.g. the backend's quota).
+        parts.append(color(f"⏳429×{rl_wait}", "red"))
     if w["errors"] > 0:
         parts.append(color(f"!{w['errors']}err", err_color))
     if snap.get("probe_in_flight"):
         parts.append(color("probe", "cyan"))
+    sched = snap.get("schedule") or {}
+    if sched.get("pending"):
+        parts.append(color(f"⏰HIGH→{_fmt_dur_short(sched.get('seconds_until'))}", "cyan"))
+    if sched.get("low_pending"):
+        parts.append(color(f"⏰LOW→{_fmt_dur_short(sched.get('low_seconds_until'))}", "cyan"))
 
     return " ".join(parts)
 
@@ -2602,6 +2968,68 @@ async def boost_endpoint():
             status_code=409,
         )
     return limiter.snapshot()
+
+
+@app.post("/_proxy/schedule_high")
+async def schedule_high_endpoint(req: Request):
+    """Arm (or clear) a ONE-SHOT automatic LOW->HIGH switch.
+
+    Body: {"at": <value>} where value is unix epoch seconds, "HH:MM"/"HH:MM:SS"
+    (next future local occurrence), an ISO-8601 datetime, or null to clear. At
+    that time the tier promotes to HIGH once (auto-demotes on the next
+    rate-limit; use force_tier to pin). Before it fires, the pacer drains the
+    current LOW window's leftover over the shorter horizon ending at the switch.
+
+    This is independent of the recurring DAILY switch configured via
+    `scheduled_high_at` (which keeps firing every day); the proxy acts on
+    whichever comes first. Example:
+      curl -X POST localhost:8787/_proxy/schedule_high -d '{"at": "14:30"}'
+    """
+    try:
+        body = await req.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
+    if not isinstance(body, dict) or "at" not in body:
+        return JSONResponse({"error": "body must be a JSON object with 'at'"}, status_code=400)
+    raw = body["at"]
+    ts = parse_switch_time(raw)
+    if raw is not None and ts is None:
+        return JSONResponse(
+            {"error": "'at' must be unix seconds, 'HH:MM[:SS]', an ISO-8601 "
+                      "datetime, or null"},
+            status_code=400,
+        )
+    return limiter.set_oneshot_switch(ts)
+
+
+@app.post("/_proxy/schedule_low")
+async def schedule_low_endpoint(req: Request):
+    """Arm (or clear) a ONE-SHOT automatic HIGH->LOW switch.
+
+    Body: {"at": <value>} where value is unix epoch seconds, "HH:MM"/"HH:MM:SS"
+    (next future local occurrence), an ISO-8601 datetime, or null to clear. At
+    that time the tier drops to LOW once.
+
+    Mirror of POST /_proxy/schedule_high, and independent of the recurring DAILY
+    switch configured via `scheduled_low_at`; the proxy acts on whichever comes
+    first. Example:
+      curl -X POST localhost:8787/_proxy/schedule_low -d '{"at": "09:00"}'
+    """
+    try:
+        body = await req.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
+    if not isinstance(body, dict) or "at" not in body:
+        return JSONResponse({"error": "body must be a JSON object with 'at'"}, status_code=400)
+    raw = body["at"]
+    ts = parse_switch_time(raw)
+    if raw is not None and ts is None:
+        return JSONResponse(
+            {"error": "'at' must be unix seconds, 'HH:MM[:SS]', an ISO-8601 "
+                      "datetime, or null"},
+            status_code=400,
+        )
+    return limiter.set_oneshot_low_switch(ts)
 
 
 @app.post("/_proxy/window/count")
@@ -2709,6 +3137,8 @@ async def proxy(full_path: str, request: Request):
             # error / client abort) is taken back off the window count.
             if not (200 <= status < 400):
                 limiter.discount_request(noted_weight, noted_token, lane)
+            # Always drop it from the in-flight tally (any outcome ends its life).
+            limiter.note_done(noted_weight, lane)
             metrics.request_finished(model, started_at, status, usage)
 
     try:
@@ -2773,7 +3203,14 @@ async def proxy(full_path: str, request: Request):
                             if k.lower() not in HOP_BY_HOP
                         },
                     )
-                await asyncio.sleep(backoff)
+                # Parked waiting out upstream pushback — surface it so the
+                # dashboard shows the client is waiting (the request holds no
+                # slot here and isn't a concurrency waiter).
+                limiter.enter_rl_wait(lane)
+                try:
+                    await asyncio.sleep(backoff)
+                finally:
+                    limiter.leave_rl_wait(lane)
                 continue
 
             is_success = 200 <= response.status_code < 400
@@ -2808,8 +3245,11 @@ async def proxy(full_path: str, request: Request):
                 headers=out_headers,
             )
     finally:
+        # Reached without handing off a response (e.g. cancellation/unexpected
+        # error escaping the loop). Run finalize so the request is dropped from
+        # the in-flight tally and its window count reversed, not just recorded.
         if not handed_off and not finished:
-            metrics.request_finished(model, started_at, 0)
+            finalize(0)
 
 
 async def serve() -> None:
