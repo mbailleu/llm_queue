@@ -512,8 +512,6 @@ class Limiter:
             window_seconds = float(state.get("window_seconds")
                                    or self._active.window_seconds)
             auto = max(0.0, float(state.get("count_auto", 0) or 0))
-            human = state.get("count_human")
-            human = max(0.0, float(human)) if human is not None else max(0.0, count - auto)
         except (TypeError, ValueError):
             return False
         if time.time() - start >= window_seconds:
@@ -521,8 +519,12 @@ class Limiter:
             return False
         self._window_start = start
         self._window_count = count
+        # The human share is derived from count - auto rather than read from the
+        # saved count_human (which is still written, for inspectability), so the
+        # lane-split invariant human + auto == count holds even if the file was
+        # hand-edited into an inconsistent state.
         self._window_auto_count = min(auto, count)
-        self._window_human_count = min(human, count - self._window_auto_count)
+        self._window_human_count = count - self._window_auto_count
         log.info(f"window: restored count={count} "
                  f"(human={self._window_human_count} auto={self._window_auto_count}) "
                  f"started_at={start}")
@@ -1860,7 +1862,7 @@ def _next_time_of_day(tod_seconds: float, now: float) -> float:
 
 
 def parse_switch_time(value: Any, now: float | None = None) -> float | None:
-    """Resolve a `scheduled_high_at` config/API value to absolute unix seconds.
+    """Resolve a scheduled-switch time (config key or API body) to unix seconds.
 
     Accepts:
       - None / "" / 0           -> None (no scheduled switch)
@@ -1904,7 +1906,7 @@ def parse_switch_time(value: Any, now: float | None = None) -> float | None:
     try:
         return _dt.datetime.fromisoformat(s).timestamp()
     except ValueError:
-        log.warning(f"scheduled_high_at: could not parse {value!r}; ignoring")
+        log.warning(f"scheduled switch time: could not parse {value!r}; ignoring")
         return None
 
 
@@ -1948,6 +1950,9 @@ async def apply_config_change(new_cfg: dict[str, Any]) -> None:
     global config
     if new_cfg.get("upstream_base_url") != config.get("upstream_base_url"):
         log.warning("config: upstream_base_url changed -> restart required")
+    if client is not None and new_cfg.get("upstream_timeout") != config.get("upstream_timeout"):
+        client.timeout = httpx.Timeout(float(new_cfg["upstream_timeout"]), connect=15.0)
+        log.info(f"config: upstream_timeout -> {new_cfg['upstream_timeout']}s")
     log_level = str(new_cfg.get("log_level", "INFO")).upper()
     logging.getLogger().setLevel(log_level)
     forced = new_cfg.get("force_tier") if new_cfg.get("force_tier") in ("low", "high") else None
@@ -2636,7 +2641,8 @@ async function tick() {
       // Split + end-of-window estimate: human "so far → projected", background
       // (auto) "so far → projected" (projected_auto comes from the pacer).
       const ch = W.count_human ?? 0, ca = W.count_auto ?? 0;
-      const ph = W.projected_human ?? ch, pa = P.projected_auto ?? ca;
+      // Projections are estimates; whole requests read better than decimals.
+      const ph = Math.round(W.projected_human ?? ch), pa = Math.round(P.projected_auto ?? ca);
       winCard = `
         <div class="stat">
           <div class="label">${winLabel}</div>
@@ -2713,13 +2719,13 @@ async function tick() {
     document.getElementById("throughput-grid").innerHTML = tpHtml;
 
     if (m.persistent) {
-      const P = m.persistent;
+      const PS = m.persistent;  // don't shadow P (the pacer) above
       const totalCards = [
         ["24h", "24h"], ["Weekly", "7d"], ["Monthly", "30d"], ["Lifetime", "lifetime"],
       ];
       let totHtml = "";
       for (const [label, key] of totalCards) {
-        const o = (P[key] && P[key].overall) || {count:0, errors:0, input_tokens:0, output_tokens:0, cache_creation_input_tokens:0, cache_read_input_tokens:0, cost:null};
+        const o = (PS[key] && PS[key].overall) || {count:0, errors:0, input_tokens:0, output_tokens:0, cache_creation_input_tokens:0, cache_read_input_tokens:0, cost:null};
         const inTot = o.input_tokens + (o.cache_creation_input_tokens||0) + (o.cache_read_input_tokens||0);
         const errBadge = o.errors > 0 ? ` <span class="err">(${o.errors} err)</span>` : "";
         const costBadge = o.cost !== null && o.cost !== undefined ? ` · ${fmtCost(o.cost)}` : "";

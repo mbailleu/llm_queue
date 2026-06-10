@@ -1,7 +1,6 @@
 # anthropic_proxy config — edit and save; the proxy hot-reloads.
-# Hot-reloadable: tiers, force_tier, scheduled_high_at, scheduled_low_at, log_level, retry_*,
-#                 upstream_timeout, promotion_cooldown_seconds, config_poll_seconds.
-# Restart required: upstream_base_url, listen_host, listen_port.
+# Hot-reloadable: every key except the ones below.
+# Restart required: upstream_base_url, listen_host, listen_port, throttle_listen_port.
 
 # Where to forward requests. Set this to your custom service. Every path/header
 # is forwarded verbatim, so the same upstream can serve both the Anthropic
