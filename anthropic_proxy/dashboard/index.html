@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>anthropic_proxy</title>
+<script>
+  /* Apply a saved theme before first paint to avoid a flash — this must run
+     before the stylesheet paints, so it stays inline. "auto" (or no value)
+     leaves data-theme unset so the prefers-color-scheme media query governs;
+     "light"/"dark" pin it explicitly. */
+  (function () {
+    try {
+      var t = localStorage.getItem("theme");
+      if (t === "light" || t === "dark") {
+        document.documentElement.setAttribute("data-theme", t);
+      }
+    } catch (e) {}
+  })();
+</script>
+<link rel="stylesheet" href="/_proxy/static/styles.css" />
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div>
+      <h1>anthropic_proxy</h1>
+      <div class="sub" id="upstream"></div>
+    </div>
+    <div style="display:flex; align-items:baseline; gap:12px;">
+      <button id="theme-btn" title="Theme: Auto follows your system; click to cycle Auto → Light → Dark">🖥 Auto</button>
+      <button id="boost-btn" title="Temporarily switch to HIGH; auto-demotes to LOW on the first rate-limit">⚡ Boost HIGH</button>
+      <div id="live">connecting…</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Current State</h2>
+    <div id="state-grid" class="grid"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Throughput · requests processed</h2>
+    <div id="throughput-grid" class="grid"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Totals · persisted (weekly / monthly / lifetime)</h2>
+    <div id="totals-grid" class="grid"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head">
+      <h2 style="margin:0">Graphs</h2>
+      <div id="series-controls" class="seg">
+        <button data-w="24h" class="active">24h</button>
+        <button data-w="7d">7d</button>
+        <button data-w="30d">30d</button>
+        <button data-w="lifetime">lifetime</button>
+      </div>
+    </div>
+    <div class="chart-block">
+      <div class="chart-title">Requests <span id="chart-requests-legend" class="legend"></span></div>
+      <svg id="chart-requests" class="chart" preserveAspectRatio="none"></svg>
+    </div>
+    <div class="chart-block">
+      <div class="chart-title">Tokens <span id="chart-tokens-legend" class="legend"></span></div>
+      <svg id="chart-tokens" class="chart" preserveAspectRatio="none"></svg>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Overall Latency</h2>
+    <table id="overall-table"></table>
+  </div>
+
+  <div class="panel">
+    <h2>Overall Tokens &amp; Cost</h2>
+    <table id="overall-tokens-table"></table>
+  </div>
+
+  <div class="panel">
+    <h2>Per Model</h2>
+    <div id="per-model"></div>
+  </div>
+
+  <div class="footer">
+    metrics refresh every 2s · graphs every 15s ·
+    <a href="/_proxy/metrics">metrics json</a> ·
+    <a href="/_proxy/series?window=7d">series json</a> ·
+    <a href="/_proxy/config">config json</a> ·
+    <a href="/_proxy/status">limiter status</a>
+  </div>
+</div>
+<script src="/_proxy/static/app.js"></script>
+</body>
+</html>

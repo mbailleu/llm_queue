@@ -1,0 +1,155 @@
+/* Dark theme (default). Light values live in the two blocks below: one for
+   the system "prefers light" setting (auto), one for the explicit
+   [data-theme="light"] toggle override. */
+:root {
+  --bg: #0d1117; --panel: #161b22; --border: #30363d;
+  --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+  --green: #3fb950; --yellow: #d29922; --red: #f85149;
+  --card-bg: rgba(0,0,0,0.25); --card-border: rgba(255,255,255,0.03);
+  --chart-bg: rgba(0,0,0,0.2); --bar-track: rgba(255,255,255,0.08);
+  --grid: #30363d; --accent-tint: rgba(88,166,255,0.15);
+}
+/* Auto: follow the OS setting when the user hasn't picked a theme (no
+   data-theme attribute). Reacts live to system light/dark changes. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --bg: #ffffff; --panel: #f6f8fa; --border: #d0d7de;
+    --text: #1f2328; --muted: #656d76; --accent: #0969da;
+    --green: #1a7f37; --yellow: #9a6700; --red: #cf222e;
+    --card-bg: rgba(0,0,0,0.03); --card-border: rgba(0,0,0,0.06);
+    --chart-bg: rgba(0,0,0,0.03); --bar-track: rgba(0,0,0,0.08);
+    --grid: #d0d7de; --accent-tint: rgba(9,105,218,0.12);
+  }
+}
+/* Manual override: the toggle sets data-theme="light"|"dark" on <html>. */
+:root[data-theme="light"] {
+  --bg: #ffffff; --panel: #f6f8fa; --border: #d0d7de;
+  --text: #1f2328; --muted: #656d76; --accent: #0969da;
+  --green: #1a7f37; --yellow: #9a6700; --red: #cf222e;
+  --card-bg: rgba(0,0,0,0.03); --card-border: rgba(0,0,0,0.06);
+  --chart-bg: rgba(0,0,0,0.03); --bar-track: rgba(0,0,0,0.08);
+  --grid: #d0d7de; --accent-tint: rgba(9,105,218,0.12);
+}
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: var(--bg); color: var(--text);
+  margin: 0; padding: 20px; font-size: 14px;
+}
+.container { max-width: 1600px; margin: 0 auto; }
+h1 { margin: 0 0 4px 0; font-size: 20px; font-weight: 600; }
+.header {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin-bottom: 20px;
+}
+.header .sub { color: var(--muted); font-size: 12px; }
+#live { font-size: 12px; color: var(--green); font-variant-numeric: tabular-nums; }
+#live.error { color: var(--red); }
+.panel {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; padding: 16px; margin-bottom: 16px;
+}
+.panel h2 {
+  margin: 0 0 12px 0; font-size: 11px; font-weight: 600;
+  color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px;
+}
+/* Wrapping flexbox (not CSS grid): every card is at least as wide as its
+   own content (the nowrap .sub lines below), so text never wraps mid-line;
+   cards flow onto extra rows only when the row truly runs out of space. */
+.grid { display: flex; flex-wrap: wrap; gap: 10px; }
+.stat {
+  flex: 1 1 150px;
+  background: var(--card-bg); padding: 12px; border-radius: 6px;
+  border: 1px solid var(--card-border);
+}
+.stat .label {
+  color: var(--muted); font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.7px; margin-bottom: 6px;
+}
+.stat .value {
+  font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+.stat .value.tier-low { color: var(--yellow); }
+.stat .value.tier-high { color: var(--green); }
+.stat .value.warn { color: var(--yellow); }
+.stat .value.crit { color: var(--red); }
+.stat .sub { color: var(--muted); font-size: 11px; margin-top: 4px; white-space: nowrap; }
+table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+tr:last-child td { border-bottom: none; }
+th:first-child, td:first-child { text-align: left; }
+th {
+  color: var(--muted); font-weight: 600; text-transform: uppercase;
+  font-size: 10px; letter-spacing: 0.7px;
+}
+.model-card {
+  margin-bottom: 12px; padding: 12px;
+  background: var(--card-bg); border-radius: 6px;
+  border: 1px solid var(--card-border);
+}
+.model-card:last-child { margin-bottom: 0; }
+.model-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin-bottom: 8px;
+}
+.model-name {
+  font-weight: 600; color: var(--accent);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px;
+}
+.model-active { color: var(--muted); font-size: 11px; }
+.model-active strong { color: var(--text); }
+.footer { color: var(--muted); font-size: 11px; margin-top: 20px; text-align: center; }
+.footer a { color: var(--muted); }
+.empty { color: var(--muted); font-style: italic; text-align: center; padding: 12px; }
+.err { color: var(--red); }
+.ok { color: var(--green); }
+#boost-btn, #theme-btn {
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+#boost-btn:hover:not(:disabled) { border-color: var(--green); color: var(--green); }
+#boost-btn:disabled { opacity: 0.5; cursor: default; }
+#theme-btn:hover { border-color: var(--accent); color: var(--accent); }
+.panel-head {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 12px;
+}
+.panel-head h2 {
+  font-size: 11px; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.8px;
+}
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.seg button {
+  background: var(--panel); color: var(--muted); border: none;
+  padding: 4px 10px; font-size: 11px; cursor: pointer; font-weight: 600;
+  border-left: 1px solid var(--border);
+}
+.seg button:first-child { border-left: none; }
+.seg button:hover { color: var(--text); }
+.seg button.active { background: var(--accent-tint); color: var(--accent); }
+.chart-block { margin-bottom: 14px; }
+.chart-block:last-child { margin-bottom: 0; }
+.chart-title {
+  color: var(--muted); font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.7px; margin-bottom: 6px; display: flex;
+  align-items: center; gap: 12px;
+}
+.legend { display: inline-flex; gap: 10px; text-transform: none; letter-spacing: 0; }
+.legend span { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+.legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+svg.chart {
+  width: 100%; height: 150px; display: block;
+  background: var(--chart-bg); border-radius: 6px;
+}
+svg.chart text { fill: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; }
+.bar {
+  height: 6px; border-radius: 3px; background: var(--bar-track);
+  overflow: hidden; margin-top: 8px;
+}
+.bar > i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+.bar > i.warn { background: var(--yellow); }
+.bar > i.crit { background: var(--red); }
