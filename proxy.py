@@ -408,16 +408,33 @@ class Limiter:
                 "started_at": None,
                 "elapsed_seconds": None,
                 "remaining_seconds": None,
+                "effective_remaining_seconds": None,
+                "switch_at": None,
             }
         elapsed = now - ws
         remaining = max(0.0, window_seconds - elapsed)
         count = self._window_count
+        # A pending LOW->HIGH switch ends this window early: at the switch the
+        # window restarts under HIGH, so everything (the pacer's drain rate, the
+        # human/background projections, the dashboard countdown) should treat the
+        # switch time as the effective window end. Only relevant while LOW — a
+        # HIGH->LOW switch doesn't shorten anything to drain. `effective_remaining`
+        # is what every consumer should use; `remaining_seconds` stays the true
+        # window remaining for reference.
+        effective_remaining = remaining
+        switch_at = self.scheduled_switch_at() if self._active is self._low else None
+        if switch_at is not None:
+            until = switch_at - now
+            if until > 0:
+                effective_remaining = min(effective_remaining, until)
+            else:
+                switch_at = None  # already due; the switch itself will roll the window
         # Estimated human total by window end: what humans have spent so far plus
-        # their measured arrival rate projected over the time left (raw, no safety
-        # factor — this is a display estimate, not the pacer's reservation). The
-        # background (auto) projection is added by AutoPacer.status() since it
-        # owns the leftover-budget calculation.
-        projected_human = self._window_human_count + self.human_rate() * remaining
+        # their measured arrival rate projected over the (effective) time left —
+        # raw, no safety factor; this is a display estimate, not the pacer's
+        # reservation. The background (auto) projection is added by
+        # AutoPacer.status() since it owns the leftover-budget calculation.
+        projected_human = self._window_human_count + self.human_rate() * effective_remaining
         return {
             "active": True,
             "tier": self._active.name,
@@ -430,6 +447,8 @@ class Limiter:
             "started_at": ws,
             "elapsed_seconds": elapsed,
             "remaining_seconds": remaining,
+            "effective_remaining_seconds": effective_remaining,
+            "switch_at": switch_at,
         }
 
     # -- manual window overrides + persistence (sync, await-free: atomic under
@@ -979,15 +998,15 @@ class AutoPacer:
         if not snap["active"]:
             # No window open yet — the first request anchors it; let it through.
             return 1.0, float("inf")
-        remaining = float(snap["remaining_seconds"] or 0.0)
-        # A scheduled LOW->HIGH switch ends the current LOW window early: pace as
-        # if the window closes at the switch time, so the leftover drains over the
-        # shorter horizon (and the predicted-human term shrinks toward it too).
-        switch_at = self._limiter.scheduled_switch_at()
-        if switch_at is not None and snap.get("tier") == "low":
-            until = switch_at - time.time()
-            if until > 0:  # only a still-future switch ends the window early
-                remaining = min(remaining, until)
+        # `effective_remaining_seconds` already folds in a pending LOW->HIGH
+        # switch (the window snapshot caps it at the switch time), so the leftover
+        # drains over the shorter horizon and the predicted-human term shrinks
+        # with it. Fall back to the true remaining if the field is absent.
+        remaining = float(
+            snap.get("effective_remaining_seconds")
+            if snap.get("effective_remaining_seconds") is not None
+            else snap.get("remaining_seconds") or 0.0
+        )
         if remaining <= 0:
             return 1.0, float("inf")  # window about to roll; drain freely
         limit = float(snap["limit"])
@@ -2601,9 +2620,18 @@ async function tick() {
           <div class="bar"><i style="width:0%"></i></div>
         </div>`;
     } else {
-      const timePct = pct(W.elapsed_seconds, W.window_seconds);
       const usePct = pct(W.count, W.limit);
       const useClass = usePct >= 95 ? "crit" : usePct >= 80 ? "warn" : "";
+      // A pending LOW→HIGH switch ends the window early: count down to (and fill
+      // the time bar toward) the switch, matching the shortened pacing horizon.
+      const effRem = W.effective_remaining_seconds ?? W.remaining_seconds;
+      const shortened = W.switch_at != null && effRem < (W.remaining_seconds - 1);
+      const timePct = shortened
+        ? pct(W.elapsed_seconds, W.elapsed_seconds + effRem)
+        : pct(W.elapsed_seconds, W.window_seconds);
+      const leftSub = shortened
+        ? `${fmtSpan(effRem)} to ⏰HIGH (${fmtSpan(W.remaining_seconds)} window)`
+        : `${fmtSpan(W.remaining_seconds)} left`;
       // Split + end-of-window estimate: human "so far → projected", background
       // (auto) "so far → projected" (projected_auto comes from the pacer).
       const ch = W.count_human ?? 0, ca = W.count_auto ?? 0;
@@ -2612,7 +2640,7 @@ async function tick() {
         <div class="stat">
           <div class="label">${winLabel}</div>
           <div class="value ${useClass}">${W.count} / ${W.limit}</div>
-          <div class="sub">${fmtSpan(W.elapsed_seconds)} in · ${fmtSpan(W.remaining_seconds)} left</div>
+          <div class="sub">${fmtSpan(W.elapsed_seconds)} in · ${leftSub}</div>
           <div class="sub">human ${ch}→~${ph} · auto ${ca}→~${pa}</div>
           <div class="bar"><i class="${useClass}" style="width:${timePct.toFixed(1)}%"></i></div>
         </div>`;

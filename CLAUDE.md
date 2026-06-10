@@ -92,7 +92,14 @@ exact line numbers are deliberately omitted since they drift on every edit.
     the weight into a per-lane split (`_window_human_count` /
     `_window_auto_count`, invariant: they sum to `_window_count`); the snapshot
     exposes `count_human` / `count_auto` plus a `projected_human` end-of-window
-    estimate (`count_human + human_rate·remaining`). `discount_request(weight,
+    estimate (`count_human + human_rate·effective_remaining`). A pending LOW→HIGH
+    switch ends the window early, so the snapshot also exposes
+    `effective_remaining_seconds` (= `remaining_seconds` capped at the switch
+    time, only while LOW; `remaining_seconds` stays the true window remaining) +
+    `switch_at`, and projects humans over that shorter horizon. This is the single
+    source of truth the pacer and dashboard both read, so the countdown, the
+    human/auto projections, and the drain rate all shorten together.
+    `discount_request(weight,
     token, lane)` reverses both the total and the lane count when a request
     ultimately fails (so the window counts only quota that was actually
     consumed), no-op if the window has since rolled. `note_request` also adds the
@@ -128,8 +135,11 @@ exact line numbers are deliberately omitted since they drift on every edit.
   `max_concurrent/avg_request_time`. The `min(…, lookahead)`
   (`human_demand_lookahead_seconds`) stops a long (e.g. 5h LOW) window from
   reserving nearly all quota off a small human rate. A pending scheduled LOW→HIGH
-  switch (`limiter.scheduled_switch_at()`) caps the effective `remaining` at the
-  switch time, so the LOW leftover drains over the shorter horizon. Near window
+  switch shortens the horizon — but the capping now lives in the window snapshot
+  (`effective_remaining_seconds`), which the pacer reads directly instead of
+  re-deriving it from `scheduled_switch_at()`; this keeps the drain rate, the
+  human/background projections, and the dashboard countdown all shortened in
+  lockstep. So the LOW leftover drains over the shorter horizon. Near window
   end the predicted-human term vanishes so auto can drain ~100%; if humans already spent
   the window, `usable ≤ 0` and auto parks. `gate()` clamps its internal `_next`
   schedule to at most one *current* interval ahead, so a rate jump (window/tier
