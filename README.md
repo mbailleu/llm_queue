@@ -32,17 +32,24 @@ Anthropic, OpenAI Chat Completions, and OpenAI Responses `usage` shapes).
 ## Layout
 
 ```
-proxy.py          single-file FastAPI app (PEP 723 inline deps)
+anthropic_proxy/  the application package
+  limiter.py        concurrency tiers, queue, lanes, quota window
+  pacer.py          automation-lane pacing
+  usage.py          provider usage parsing (Anthropic + OpenAI shapes)
+  metrics.py        rolling metrics + pricing
+  persistence.py    stats.json + window.json
+  config.py         defaults, loading, hot-reload
+  server.py         FastAPI app, proxy handler, dual-port serve()
+  routes.py         /_proxy/* endpoints
+  dashboard/        index.html / styles.css / app.js
+proxy.py          thin shim (PEP 723 inline deps) so `uv run proxy.py` works
 config.yaml       all settings; hot-reloaded
 statusline.sh     wrapper for Claude Code / tmux status bars
-requirements.txt  for pip users
+pyproject.toml    package metadata + deps (`pip install -e .`)
+tests/            unit tests for the pure modules
 stats.json        persisted long-horizon stats (auto-created; git-ignored)
 window.json       persisted current quota-window state (auto-created; git-ignored)
 ```
-
-> The whole app currently lives in `proxy.py`. A planned split into a package
-> (limiter / metrics / persistence / dashboard / server) is sketched in
-> [`CLAUDE.md`](CLAUDE.md).
 
 ## Run it
 
@@ -57,8 +64,8 @@ Option B — pip + venv:
 
 ```sh
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python proxy.py
+pip install -e .
+python -m anthropic_proxy        # or: python proxy.py
 ```
 
 It listens on **two ports** by default: `8787` for the human lane and `8788`
