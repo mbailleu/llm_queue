@@ -2210,7 +2210,7 @@ DASHBOARD_HTML = """<!doctype html>
     background: var(--bg); color: var(--text);
     margin: 0; padding: 20px; font-size: 14px;
   }
-  .container { max-width: 1100px; margin: 0 auto; }
+  .container { max-width: 1600px; margin: 0 auto; }
   h1 { margin: 0 0 4px 0; font-size: 20px; font-weight: 600; }
   .header {
     display: flex; justify-content: space-between; align-items: baseline;
@@ -2227,11 +2227,12 @@ DASHBOARD_HTML = """<!doctype html>
     margin: 0 0 12px 0; font-size: 11px; font-weight: 600;
     color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px;
   }
-  .grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    gap: 10px;
-  }
+  /* Wrapping flexbox (not CSS grid): every card is at least as wide as its
+     own content (the nowrap .sub lines below), so text never wraps mid-line;
+     cards flow onto extra rows only when the row truly runs out of space. */
+  .grid { display: flex; flex-wrap: wrap; gap: 10px; }
   .stat {
+    flex: 1 1 150px;
     background: var(--card-bg); padding: 12px; border-radius: 6px;
     border: 1px solid var(--card-border);
   }
@@ -2246,7 +2247,7 @@ DASHBOARD_HTML = """<!doctype html>
   .stat .value.tier-high { color: var(--green); }
   .stat .value.warn { color: var(--yellow); }
   .stat .value.crit { color: var(--red); }
-  .stat .sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .stat .sub { color: var(--muted); font-size: 11px; margin-top: 4px; white-space: nowrap; }
   table {
     width: 100%; border-collapse: collapse; font-size: 13px;
     font-variant-numeric: tabular-nums;
@@ -2646,11 +2647,26 @@ async function tick() {
         </div>`;
     }
 
+    // Pending scheduled switches get one sub-line each (they're too long to
+    // share the tier mode line without forcing the card extremely wide).
+    const sched = L.schedule || {};
+    const schedSubs = [];
+    if (sched.pending) {
+      schedSubs.push("⏰HIGH " + (sched.recurring
+        ? "daily @" + sched.daily_at + " (in " + fmtSpan(sched.seconds_until) + ")"
+        : "in " + fmtSpan(sched.seconds_until)));
+    }
+    if (sched.low_pending) {
+      schedSubs.push("⏰LOW " + (sched.low_recurring
+        ? "daily @" + sched.low_daily_at + " (in " + fmtSpan(sched.low_seconds_until) + ")"
+        : "in " + fmtSpan(sched.low_seconds_until)));
+    }
     document.getElementById("state-grid").innerHTML = `
       <div class="stat">
         <div class="label">Active Tier</div>
         <div class="value ${tierClass}">${L.active_tier.toUpperCase()}</div>
-        <div class="sub">${L.forced_tier ? "forced" : "auto"}${L.probe_in_flight ? " · probing" : ""}${(L.schedule && L.schedule.pending) ? " · ⏰HIGH " + (L.schedule.recurring ? "daily @" + L.schedule.daily_at + " (in " + fmtSpan(L.schedule.seconds_until) + ")" : "in " + fmtSpan(L.schedule.seconds_until)) : ""}${(L.schedule && L.schedule.low_pending) ? " · ⏰LOW " + (L.schedule.low_recurring ? "daily @" + L.schedule.low_daily_at + " (in " + fmtSpan(L.schedule.low_seconds_until) + ")" : "in " + fmtSpan(L.schedule.low_seconds_until)) : ""}</div>
+        <div class="sub">${L.forced_tier ? "forced" : "auto"}${L.probe_in_flight ? " · probing" : ""}</div>
+        ${schedSubs.map((s) => `<div class="sub">${s}</div>`).join("")}
       </div>
       <div class="stat">
         <div class="label">In Flight</div>
