@@ -21,15 +21,21 @@ listen_port: 8787
 throttle_listen_port: 8788
 
 # --- Automation-lane pacing ---
-# The pacer admits automation at rate = usable / time_left, where
-#   usable = window_limit - used
-#            - human_demand_safety * human_rate * min(time_left, lookahead)
-#            - human_quota_floor
-# so it holds back what humans are *statistically predicted* to still need. As
-# the window nears its end that prediction term shrinks to ~0, letting
-# automation drain up to 100% of what's left. The rate is also capped by the
-# physical pipe (free slots / measured avg request time), and concurrency stays
-# bounded by max_concurrent (with human priority).
+# Every quota budget of the active tier (see `tiers.*.limits` below) is
+# evaluated and the most constraining ("binding") one sets the pace. Per
+# budget, in that budget's units (requests, tokens, or $):
+#   usable = limit - used
+#            - human_demand_safety * human_rate * units_per_request
+#                                  * min(time_left, lookahead)
+#            - human_quota_floor                     (requests budgets only)
+#   rate   = (usable / units_per_request) / time_left
+# so it holds back what humans are *statistically predicted* to still need.
+# units_per_request converts requests <-> tokens/$ via a live per-request EWMA
+# (the auto_assumed_* values below apply before any traffic). As a window nears
+# its end the prediction term shrinks to ~0, letting automation drain up to
+# 100% of what's left. The rate is also capped by the physical pipe (free
+# slots / measured avg request time), and concurrency stays bounded by
+# max_concurrent (with human priority).
 auto_pacing_enabled: true
 human_demand_safety: 1.5            # >1 leaves more headroom for humans (slower auto)
 human_demand_horizon_seconds: 3600  # window over which the human request rate is measured
@@ -38,6 +44,8 @@ human_demand_lookahead_seconds: 3600  # cap on how far ahead that rate is projec
 human_quota_floor: 0                # hard floor of requests always kept free for humans (0 = purely statistical)
 auto_concurrency_reserve: 0         # slots reserved for humans (auto capped at max_concurrent - this; 0 = rely on priority)
 auto_assumed_request_seconds: 30.0  # avg request time assumed before any latency is measured
+auto_assumed_tokens_per_request: 20000  # tokens per request assumed before any completion is measured
+auto_assumed_cost_per_request: 0.05     # USD per request assumed before any completion is measured
 auto_poll_seconds: 1.0              # how often a parked/over-pace auto request re-checks
 
 # Which tier to assume at startup. The proxy will auto-switch from here based
@@ -71,27 +79,57 @@ scheduled_high_at: null
 #   curl -X POST localhost:8787/_proxy/schedule_low -d '{"at": null}'       # clear one-shot
 scheduled_low_at: null
 
-# The two tiers — each has a max concurrency cap plus its own rolling
-# request-quota window (window_limit requests per window_seconds). There is no
-# preemptive per-window pacing: requests are admitted as fast as the cap allows,
-# and when upstream rate-limits (429/503/529) the proxy retries with backoff so
-# callers wait then. The proxy auto-detects which cap upstream currently allows
-# by probing HIGH when LOW is saturated (see promotion_cooldown_seconds).
+# The two tiers — each has a max concurrency cap plus a LIST of rolling quota
+# budgets (`limits`). Every entry is one budget: `limit` units of `metric` per
+# `window_seconds`, where metric is
+#   requests — weighted request count (see model_window_weights below)
+#   tokens   — input + output + cache_creation + cache_read tokens
+#   cost     — USD, priced via model_pricing (an UNPRICED model contributes $0,
+#              so cost budgets only mean something for models listed there!)
+# All budgets are tracked simultaneously and each window rolls independently
+# (a 60s window rolls many times inside a 5h one). Requests are counted at
+# admission; tokens/cost land when the response completes. The most-utilized
+# budget is the "binding" one shown by the dashboard/statusline, and the
+# auto-lane pacer paces against whichever budget is most constraining.
 #
-# Each tier's window drives the dashboard "X / N this window" indicator while
-# that tier is active, and the counter RESTARTS (fresh count + timer, under the
-# new tier's limit/duration) every time the active tier switches LOW<->HIGH.
-# window_seconds/window_limit are optional per tier; when omitted they fall back
-# to the top-level rate_window_seconds / rate_window_limit below.
+# There is still no preemptive human-lane enforcement: humans are admitted as
+# fast as max_concurrent allows, and when upstream rate-limits (429/503/529)
+# the proxy retries with backoff so callers wait then. The proxy auto-detects
+# which tier upstream currently allows by probing HIGH when LOW is saturated
+# (see promotion_cooldown_seconds). All the active tier's windows RESTART
+# (fresh counts + timers, under the new tier's budgets) every time the active
+# tier switches LOW<->HIGH.
+#
+# LEGACY STYLE (still fully supported, in case the plan reverts to
+# request-based limits): omit `limits` and give the tier window_seconds /
+# window_limit — that becomes a single requests budget. When those are omitted
+# too they fall back to the top-level rate_window_seconds / rate_window_limit
+# below. If a tier has BOTH `limits` and the legacy keys, `limits` wins.
 tiers:
   low:
-    max_concurrent: 4
-    window_seconds: 18000     # 5h
-    window_limit: 600
+    max_concurrent: 4                                        # concurrent requests
+    limits:
+      - {metric: requests, limit: 20,     window_seconds: 60}     # 20 req/min
+      - {metric: tokens,   limit: 500000, window_seconds: 60}     # 500k tokens/min
+      - {metric: cost,     limit: 50,     window_seconds: 60}     # $50/min
+      - {metric: cost,     limit: 30,     window_seconds: 18000}  # $30 per 5h
   high:
-    max_concurrent: 1000
-    window_seconds: 3600      # 1h
-    window_limit: 99999       # per-hour ceiling once promoted to HIGH
+    max_concurrent: 1000                                     # concurrent requests
+    limits:
+      - {metric: requests, limit: 1000,   window_seconds: 60}     # 1000 req/min
+      - {metric: tokens,   limit: 500000, window_seconds: 60}     # 500k tokens/min
+      - {metric: cost,     limit: 50,     window_seconds: 60}     # $50/min
+      - {metric: cost,     limit: 100,    window_seconds: 3600}   # $100 per 1h
+# Legacy example (single request window per tier):
+# tiers:
+#   low:
+#     max_concurrent: 4
+#     window_seconds: 18000     # 5h
+#     window_limit: 600
+#   high:
+#     max_concurrent: 1000
+#     window_seconds: 3600      # 1h
+#     window_limit: 99999       # per-hour ceiling once promoted to HIGH
 
 # After a HIGH->LOW demotion (or a failed probe), wait this many seconds before
 # trying to probe HIGH again.
@@ -111,21 +149,22 @@ retry_max_delay: 60.0          # cap per backoff sleep (exponential branch)
 retry_max_elapsed_seconds: 18900   # 5h15m — outlasts the 5h window below
 upstream_timeout: 600          # per-request timeout (seconds)
 
-# Fallback rolling request-quota window — used only by tiers that don't set
-# their own window_seconds/window_limit above (so older single-window configs
-# keep working). The upstream "N requests per W seconds" budget is anchored at
-# the first request after the previous window expired ("the window starts when
-# the first request is sent"). TRACKED for the dashboard "X / N this window"
-# indicator and time bar; NOT enforced here — the upstream 429 + the
-# retry/backoff above are what actually pace you.
+# LEGACY fallback rolling request-quota window — used only by tiers that have
+# no `limits` list AND don't set their own window_seconds/window_limit above
+# (so older single-window configs keep working). The upstream "N requests per
+# W seconds" budget is anchored at the first request after the previous window
+# expired ("the window starts when the first request is sent"). TRACKED for
+# the dashboard quota indicators and time bars; NOT enforced here — the
+# upstream 429 + the retry/backoff above are what actually pace you.
 rate_window_seconds: 18000     # 5h
 rate_window_limit: 600         # requests per window (fallback default)
 
 # Per-model weighting for the window count. A request for a listed model counts
-# as `factor` requests toward the "X / N this window" indicator above — e.g. an
-# Opus request can cost 2 or 4 while a Haiku request costs 1. This affects ONLY
-# the rolling window count; per-request metrics and per-model stats/counts still
-# count each request exactly once (no double-counting elsewhere).
+# as `factor` requests toward REQUESTS-metric budgets — e.g. an Opus request can
+# cost 2 or 4 while a Haiku request costs 1. Token/cost budgets are unaffected
+# (they already measure real consumption). This affects ONLY the rolling window
+# counts; per-request metrics and per-model stats/counts still count each
+# request exactly once (no double-counting elsewhere).
 # Matching: exact model name first, then substring (so "opus" matches
 # "claude-opus-4-20250514"). Models not matched use default_window_weight.
 # Weights must be > 0; invalid entries are ignored (fall back to the default).
@@ -151,17 +190,24 @@ stats_flush_seconds: 60.0          # min seconds between disk writes (when dirty
 stats_retention_days: 120          # how long hourly buckets (the graph history)
                                    # are kept; lifetime totals are kept forever
 
-# Current rolling-window state (request count + window start) is persisted here
-# every ~5s and on shutdown, then restored on boot — UNLESS the saved window has
-# already elapsed (now - start >= its window_seconds), in which case it's
-# discarded and the window starts fresh. Set/override at runtime with:
+# Current rolling-window state (one entry per budget window: count + start) is
+# persisted here every ~5s and on shutdown, then restored on boot — entries
+# whose window has already elapsed (now - start >= its window_seconds) or whose
+# budget no longer exists are discarded and start fresh. A pre-budgets
+# (single-window) file restores into the requests budget. Set/override at
+# runtime — optional "metric" / "window_seconds" select the budget window
+# (default: the requests window for count, all windows for start):
 #   curl -X POST localhost:8787/_proxy/window/count -d '{"count": 120}'
+#   curl -X POST localhost:8787/_proxy/window/count \
+#        -d '{"count": 12.5, "metric": "cost", "window_seconds": 18000}'
 #   curl -X POST localhost:8787/_proxy/window/start -d '{"started_at": 1733250000}'
 window_persist_path: "window.json"
 
 # Optional per-model pricing for cost calculation (per 1,000,000 tokens, in
 # whatever unit your provider bills in — dollars, credits, etc.).
-# - If a model isn't listed, its cost shows as "—" on the dashboard.
+# - If a model isn't listed, its cost shows as "—" on the dashboard AND it
+#   contributes $0 to any cost budgets in `tiers.*.limits` — configure pricing
+#   for every model you use if you rely on cost budgets.
 # - If cache_creation / cache_read are omitted, they default to the input rate.
 # Uncomment + edit to your provider's actual rates.
 model_pricing: {}

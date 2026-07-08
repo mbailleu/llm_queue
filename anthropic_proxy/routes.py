@@ -83,6 +83,17 @@ async def config_endpoint(req: Request):
             "values": st.config}
 
 
+def _fmt_qty(metric: str, v: float) -> str:
+    """Compact quota quantity for the statusline: $12.30 / 312k / 140."""
+    if metric == "cost":
+        return f"${v:.2f}" if v < 100 else f"${v:.0f}"
+    if v >= 1e6:
+        return f"{v / 1e6:.1f}M"
+    if v >= 1e3:
+        return f"{v / 1e3:.0f}k"
+    return f"{v:.0f}"
+
+
 def _fmt_dur_short(seconds: float | None) -> str:
     if seconds is None:
         return "—"
@@ -146,6 +157,17 @@ async def statusline_endpoint(req: Request):
         f"{window}:{w['count']}",
         _fmt_dur_short(w["avg_seconds"]),
     ]
+    # Binding quota window (the most-utilized budget): used/limit + unit, e.g.
+    # "7/20" (requests), "312k/500kT" (tokens), "$12.30/$30" (cost).
+    win = snap.get("window") or {}
+    if win.get("active"):
+        metric = win.get("metric", "requests")
+        suffix = "T" if metric == "tokens" else ""
+        util = float(win.get("utilization") or 0)
+        qtxt = f"{_fmt_qty(metric, float(win.get('count') or 0))}/" \
+               f"{_fmt_qty(metric, float(win.get('limit') or 0))}{suffix}"
+        qcolor = "red" if util >= 0.95 else "yellow" if util >= 0.8 else "reset"
+        parts.append(color(qtxt, qcolor) if qcolor != "reset" else qtxt)
     if req.query_params.get("cost") in ("1", "true", "yes") and w.get("cost") is not None:
         c = w["cost"]
         if c < 0.01:
@@ -270,13 +292,37 @@ async def schedule_low_endpoint(req: Request):
     return await _set_oneshot_switch(req, "low")
 
 
+def _window_selectors(body: dict) -> tuple[str | None, float | None] | JSONResponse:
+    """Parse the optional metric / window_seconds window selectors from a body."""
+    metric = body.get("metric")
+    if metric is not None:
+        metric = str(metric).strip().lower()
+        if metric not in ("requests", "tokens", "cost"):
+            return JSONResponse(
+                {"error": "'metric' must be 'requests', 'tokens', or 'cost'"},
+                status_code=400,
+            )
+    window_seconds = body.get("window_seconds")
+    if window_seconds is not None:
+        try:
+            window_seconds = float(window_seconds)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "'window_seconds' must be a number"},
+                                status_code=400)
+    return metric, window_seconds
+
+
 @router.post("/_proxy/window/count")
 async def set_window_count_endpoint(req: Request):
-    """Set the current rolling-window request count for the active session.
+    """Set one rolling quota window's current count.
 
-    Body: {"count": <number >= 0>}. Anchors a fresh window at now if none is
-    active. Example:
+    Body: {"count": <number >= 0>} plus optional selectors "metric"
+    ("requests" | "tokens" | "cost"; default "requests") and "window_seconds"
+    to pick which budget window when a tier tracks several. Anchors a fresh
+    window at now if the selected one isn't active. Examples:
       curl -X POST localhost:8787/_proxy/window/count -d '{"count": 120}'
+      curl -X POST localhost:8787/_proxy/window/count \\
+           -d '{"count": 12.5, "metric": "cost", "window_seconds": 18000}'
     """
     st = _st(req)
     try:
@@ -291,17 +337,27 @@ async def set_window_count_endpoint(req: Request):
         return JSONResponse({"error": "'count' must be a number"}, status_code=400)
     if count < 0:
         return JSONResponse({"error": "'count' must be >= 0"}, status_code=400)
-    snap = st.limiter.set_window_count(count)
+    sel = _window_selectors(body)
+    if isinstance(sel, JSONResponse):
+        return sel
+    snap = st.limiter.set_window_count(count, metric=sel[0], window_seconds=sel[1])
+    if snap is None:
+        return JSONResponse(
+            {"error": "no quota window matches the given metric/window_seconds"},
+            status_code=404,
+        )
     await asyncio.to_thread(save_window_file, st.limiter, st.window_persist_path())
     return {"window": snap}
 
 
 @router.post("/_proxy/window/start")
 async def set_window_start_endpoint(req: Request):
-    """Set the current rolling-window start time (unix seconds).
+    """Set rolling quota window start times (unix seconds).
 
-    Body: {"started_at": <unix seconds>} to anchor the window, or
-    {"started_at": null} to clear it (the next request re-anchors). Example:
+    Body: {"started_at": <unix seconds>} to anchor, or {"started_at": null} to
+    clear everything (the next request re-anchors fresh windows). Optional
+    selectors "metric" / "window_seconds" restrict which windows are anchored
+    (default: all of them). Example:
       curl -X POST localhost:8787/_proxy/window/start -d '{"started_at": 1733250000}'
     """
     st = _st(req)
@@ -320,6 +376,14 @@ async def set_window_start_endpoint(req: Request):
                 {"error": "'started_at' must be a unix timestamp (seconds) or null"},
                 status_code=400,
             )
-    snap = st.limiter.set_window_start(started_at)
+    sel = _window_selectors(body)
+    if isinstance(sel, JSONResponse):
+        return sel
+    snap = st.limiter.set_window_start(started_at, metric=sel[0], window_seconds=sel[1])
+    if snap is None:
+        return JSONResponse(
+            {"error": "no quota window matches the given metric/window_seconds"},
+            status_code=404,
+        )
     await asyncio.to_thread(save_window_file, st.limiter, st.window_persist_path())
     return {"window": snap}

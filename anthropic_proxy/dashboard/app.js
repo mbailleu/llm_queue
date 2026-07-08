@@ -32,6 +32,23 @@ function fmtCost(c) {
   if (c < 100) return "$" + c.toFixed(2);
   return "$" + c.toFixed(0);
 }
+const METRIC_NOUN = { requests: "req", tokens: "tok", cost: "" };
+function fmtWinLen(s) {
+  // Budget window length: "1min", "5h", "90s". Minutes are spelled "min"
+  // because card labels are uppercased — "1M" would read as a million next
+  // to token counts.
+  if (s === null || s === undefined) return "?";
+  if (s % 3600 === 0) return (s / 3600) + "h";
+  if (s % 60 === 0) return (s / 60) + "min";
+  return s + "s";
+}
+function fmtUnits(metric, v, rounded) {
+  // A quota quantity in its budget's units: $12.34 / 312.5k / 140.
+  if (v === null || v === undefined) return "—";
+  if (metric === "cost") return Number.isInteger(v) ? "$" + v : fmtCost(v);
+  if (rounded) v = Math.round(v);
+  return fmtNum(v);
+}
 const COLORS = {
   ok: "#3fb950", err: "#f85149",
   input: "#58a6ff", output: "#a371f7",
@@ -177,8 +194,11 @@ async function tick() {
       : (rlAgo !== null ? "last 429 " + fmtSpan(rlAgo) + " ago" : "none");
 
     const W = L.window || {active:false};
-    const winHrs = (W.window_seconds || 18000) / 3600;
-    const winLabel = (Number.isInteger(winHrs) ? winHrs : winHrs.toFixed(1)) + "h Window";
+    // Multi-budget quota windows: one card per budget. The old single-window
+    // shape (no `windows` list) is synthesized into a one-entry list so a
+    // stale poll during a live upgrade still renders.
+    const wins = W.windows || (W.limit != null ? [W] : []);
+    const bindingIdx = W.binding ?? 0;
     const lanes = L.lanes || {human:{in_flight:0,queued:0}, auto:{in_flight:0,queued:0,concurrency_reserve:0}, human_rate_per_min:0};
     const autoQ = lanes.auto.queued || 0;
     const laneCard = `
@@ -200,6 +220,10 @@ async function tick() {
     else if (P.next_seconds != null && P.next_seconds >= 0.05) paceSub = "next in " + fmtSpan(P.next_seconds);
     else paceSub = P.parked > 0 ? "releasing now" : "idle";
     if (P.rate_per_min != null) paceSub += " · " + P.rate_per_min + "/min budget";
+    // Which budget currently sets the pace (only interesting with >1 budget).
+    if (P.binding_metric && wins.length > 1 && (P.reason === "paced" || P.reason === "reserved")) {
+      paceSub += ` · ${P.binding_metric}/${fmtWinLen(P.binding_window_seconds)} binds`;
+    }
     const paceCard = `
       <div class="stat">
         <div class="label">Auto Pacing</div>
@@ -207,42 +231,55 @@ async function tick() {
         <div class="sub">${paceSub}</div>
       </div>`;
 
-    let winCard;
-    if (!W.active) {
-      winCard = `
+    // One quota card per budget window: "used / limit" in the budget's own
+    // units, a time bar, and per-lane spend + end-of-window projections
+    // (projected_human from the limiter, projected_auto from the pacer's
+    // per-window status, aligned by index). The most-utilized budget is the
+    // "binding" one and gets highlighted.
+    const pWins = P.windows || [];
+    const winCards = wins.map((w, i) => {
+      const metric = w.metric || "requests";
+      const noun = METRIC_NOUN[metric] ?? metric;
+      const label = "Quota · " + fmtUnits(metric, w.limit) + (noun ? " " + noun : "")
+        + " / " + fmtWinLen(w.window_seconds);
+      const isBinding = wins.length > 1 && i === bindingIdx && w.active;
+      if (!w.active) {
+        return `
         <div class="stat">
-          <div class="label">${winLabel}</div>
+          <div class="label">${label}</div>
           <div class="value">idle</div>
-          <div class="sub">starts on next request · ${W.limit} max</div>
+          <div class="sub">starts on next request</div>
           <div class="bar"><i style="width:0%"></i></div>
         </div>`;
-    } else {
-      const usePct = pct(W.count, W.limit);
+      }
+      const usePct = pct(w.count, w.limit);
       const useClass = usePct >= 95 ? "crit" : usePct >= 80 ? "warn" : "";
       // A pending LOW→HIGH switch ends the window early: count down to (and fill
       // the time bar toward) the switch, matching the shortened pacing horizon.
-      const effRem = W.effective_remaining_seconds ?? W.remaining_seconds;
-      const shortened = W.switch_at != null && effRem < (W.remaining_seconds - 1);
+      const effRem = w.effective_remaining_seconds ?? w.remaining_seconds;
+      const shortened = w.switch_at != null && effRem < (w.remaining_seconds - 1);
       const timePct = shortened
-        ? pct(W.elapsed_seconds, W.elapsed_seconds + effRem)
-        : pct(W.elapsed_seconds, W.window_seconds);
+        ? pct(w.elapsed_seconds, w.elapsed_seconds + effRem)
+        : pct(w.elapsed_seconds, w.window_seconds);
       const leftSub = shortened
-        ? `${fmtSpan(effRem)} to ⏰HIGH (${fmtSpan(W.remaining_seconds)} window)`
-        : `${fmtSpan(W.remaining_seconds)} left`;
+        ? `${fmtSpan(effRem)} to ⏰HIGH (${fmtSpan(w.remaining_seconds)} window)`
+        : `${fmtSpan(w.remaining_seconds)} left`;
       // Split + end-of-window estimate: human "so far → projected", background
-      // (auto) "so far → projected" (projected_auto comes from the pacer).
-      const ch = W.count_human ?? 0, ca = W.count_auto ?? 0;
-      // Projections are estimates; whole requests read better than decimals.
-      const ph = Math.round(W.projected_human ?? ch), pa = Math.round(P.projected_auto ?? ca);
-      winCard = `
-        <div class="stat">
-          <div class="label">${winLabel}</div>
-          <div class="value ${useClass}">${W.count} / ${W.limit}</div>
-          <div class="sub">${fmtSpan(W.elapsed_seconds)} in · ${leftSub}</div>
-          <div class="sub">human ${ch}→~${ph} · auto ${ca}→~${pa}</div>
+      // (auto) "so far → projected". Projections are estimates; rounded units
+      // read better than decimals.
+      const ch = w.count_human ?? 0, ca = w.count_auto ?? 0;
+      const ph = w.projected_human ?? ch;
+      const pa = (pWins[i] && pWins[i].projected_auto != null)
+        ? pWins[i].projected_auto : (P.projected_auto ?? ca);
+      return `
+        <div class="stat${isBinding ? " binding" : ""}">
+          <div class="label">${label}${isBinding ? " · binding" : ""}</div>
+          <div class="value ${useClass}">${fmtUnits(metric, w.count)} / ${fmtUnits(metric, w.limit)}</div>
+          <div class="sub">${fmtSpan(w.elapsed_seconds)} in · ${leftSub}</div>
+          <div class="sub">human ${fmtUnits(metric, ch)}→~${fmtUnits(metric, ph, true)} · auto ${fmtUnits(metric, ca)}→~${fmtUnits(metric, pa, true)}</div>
           <div class="bar"><i class="${useClass}" style="width:${timePct.toFixed(1)}%"></i></div>
         </div>`;
-    }
+    }).join("");
 
     // Pending scheduled switches get one sub-line each (they're too long to
     // share the tier mode line without forcing the card extremely wide).
@@ -282,7 +319,7 @@ async function tick() {
       </div>
       ${laneCard}
       ${paceCard}
-      ${winCard}
+      ${winCards}
       <div class="stat">
         <div class="label">Lifetime</div>
         <div class="value">${L.totals.requests}</div>

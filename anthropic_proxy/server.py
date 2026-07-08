@@ -165,6 +165,15 @@ async def handle_proxy(state: AppState, full_path: str, request: Request):
             # error / client abort) is taken back off the window count.
             if not (200 <= status < 400):
                 limiter.discount_request(noted_weight, noted_token, lane)
+            elif usage:
+                # Token/cost quota is only known now: fold this request's usage
+                # into the token/cost budget windows (requests were counted at
+                # admission by note_request).
+                tokens = sum(int(usage.get(k, 0) or 0) for k in (
+                    "input_tokens", "output_tokens",
+                    "cache_creation_input_tokens", "cache_read_input_tokens"))
+                cost = metrics.cost_of(model, usage) or 0.0
+                limiter.note_usage(tokens, cost, lane)
             # Always drop it from the in-flight tally (any outcome ends its life).
             limiter.note_done(noted_weight, lane)
             metrics.request_finished(model, started_at, status, usage)
@@ -234,12 +243,19 @@ async def handle_proxy(state: AppState, full_path: str, request: Request):
                     )
                 # Parked waiting out upstream pushback — surface it so the
                 # dashboard shows the client is waiting (the request holds no
-                # slot here and isn't a concurrency waiter).
+                # slot here and isn't a concurrency waiter). The sleep ends
+                # early if the tier switches to HIGH mid-wait: the Retry-After
+                # being honored was computed against the old window.
                 limiter.enter_rl_wait(lane)
                 try:
-                    await asyncio.sleep(backoff)
+                    woke_early = await limiter.rl_backoff_sleep(backoff)
                 finally:
                     limiter.leave_rl_wait(lane)
+                if woke_early:
+                    log.info(
+                        f"429 backoff cut short by LOW->HIGH switch "
+                        f"(attempt={attempt}, was sleeping {backoff:.1f}s)"
+                    )
                 continue
 
             is_success = 200 <= response.status_code < 400

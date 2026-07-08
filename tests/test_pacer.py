@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from anthropic_proxy.limiter import Limiter, Tier
+from anthropic_proxy.limiter import Budget, Limiter, Tier
 from anthropic_proxy.metrics import Metrics
 from anthropic_proxy.pacer import AutoPacer
 
@@ -109,3 +109,74 @@ def test_status_projected_auto_includes_remaining_budget():
     assert st["count_auto"] == 1
     # projected = spent (1) + leftover usable (~9)
     assert 9 <= st["projected_auto"] <= 10
+
+
+# ---- multi-budget pacing (binding budget sets the pace) ----
+
+def make_multi_setup(budgets, assumed=(100.0, 0.01), cfg_overrides=None):
+    lim = Limiter(Tier("low", 4, budgets=budgets),
+                  Tier("high", 100, 50, 1000), "low", 300.0, None)
+    lim.set_assumed_units(*assumed)
+    met = Metrics()
+    cfg = {
+        "auto_pacing_enabled": True,
+        "human_demand_safety": 1.0,
+        "human_quota_floor": 0,
+        "auto_assumed_request_seconds": 1.0,
+        "auto_poll_seconds": 0.05,
+        "human_demand_lookahead_seconds": 3600,
+        "human_demand_horizon_seconds": 3600,
+    }
+    cfg.update(cfg_overrides or {})
+    return lim, AutoPacer(lim, met, cfg)
+
+
+def test_token_budget_binds_when_most_constraining():
+    # requests would allow ~10/s; tokens (1000 units at 100 tok/req over 100s)
+    # only ~0.1/s — the token budget must set the pace.
+    lim, pacer = make_multi_setup([Budget("requests", 1000, 100),
+                                   Budget("tokens", 1000, 100)])
+    lim.note_request("m", "human")
+    usable, rate = pacer._usable_and_rate()
+    assert 9.5 <= usable <= 10.0          # 1000 tokens / 100 tok-per-req
+    assert rate <= 0.11
+    st = pacer.status()
+    assert st["binding_metric"] == "tokens"
+    assert st["binding_window_seconds"] == 100
+
+
+def test_spent_cost_budget_parks_auto():
+    lim, pacer = make_multi_setup([Budget("requests", 100, 100),
+                                   Budget("cost", 1.0, 100)])
+    lim.note_request("m", "human")
+    lim.note_usage(10, 1.0, "human")       # cost window fully spent
+    usable, rate = pacer._usable_and_rate()
+    assert usable <= 0 and rate == 0.0
+    st = pacer.status()
+    assert st["reason"] == "reserved"
+    assert st["binding_metric"] == "cost"
+
+
+def test_unpriced_cost_budget_never_binds():
+    # cost units-per-request of 0 (no pricing anywhere) makes the cost budget
+    # unconvertible AND unfillable — pacing must fall through to requests.
+    lim, pacer = make_multi_setup([Budget("requests", 10, 100),
+                                   Budget("cost", 5.0, 100)],
+                                  assumed=(100.0, 0.0))
+    lim.note_request("m", "human")
+    usable, rate = pacer._usable_and_rate()
+    assert 8.5 < usable <= 9.0             # requests leftover, as legacy
+    assert pacer.status()["binding_metric"] == "requests"
+
+
+def test_status_exposes_per_window_projections():
+    lim, pacer = make_multi_setup([Budget("requests", 10, 100),
+                                   Budget("tokens", 1000, 100)])
+    lim.note_request("m", "auto")
+    lim.note_usage(200, 0.0, "auto")       # tokens spent so far: 200
+    st = pacer.status()
+    assert len(st["windows"]) == 2
+    tok = st["windows"][1]
+    assert tok["metric"] == "tokens"
+    # projected_auto (token units) = 200 spent + leftover usable units
+    assert tok["projected_auto"] >= 200

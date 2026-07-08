@@ -17,7 +17,7 @@ from typing import Any
 
 import yaml
 
-from .limiter import Limiter, Tier
+from .limiter import BUDGET_METRICS, Budget, Limiter, Tier
 from .metrics import Metrics
 from .pacer import AutoPacer
 from .persistence import PersistentStats, load_window_file, save_window_file
@@ -56,6 +56,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Assumed request seconds before any latency has been measured (pacer uses
     # the live EWMA once traffic exists).
     "auto_assumed_request_seconds": 30.0,
+    # Assumed tokens / cost (USD) per request before any completion has been
+    # measured — used to convert token/cost budget leftovers into request rates
+    # for pacing and projections. Live per-request EWMAs take over once traffic
+    # exists. Tune to your typical traffic.
+    "auto_assumed_tokens_per_request": 20000,
+    "auto_assumed_cost_per_request": 0.05,
     # How often a parked/over-pace auto request re-checks whether it may go.
     "auto_poll_seconds": 1.0,
     "initial_tier": "low",
@@ -76,14 +82,38 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # every day. A separate ONE-SHOT switch is available via
     # POST /_proxy/schedule_low {"at": ...}. null = no daily switch. Hot-reloadable.
     "scheduled_low_at": None,
-    # Each tier has a max concurrency cap and its own rolling request-quota
-    # window (window_limit requests per window_seconds). The active tier's window
-    # drives the dashboard indicator and restarts whenever the tier switches.
-    # window_seconds/window_limit fall back to the top-level rate_window_* below
-    # when a tier omits them.
+    # Each tier has a max concurrency cap and a list of rolling quota budgets
+    # (`limits`): each entry is `limit` units of `metric` ("requests" |
+    # "tokens" | "cost") per `window_seconds`. All budgets are tracked at once;
+    # the most-utilized one is the "binding" budget shown by dashboard /
+    # statusline, and the auto-lane pacer paces against whichever budget is
+    # most constraining. Cost budgets (USD) only fill for models with
+    # `model_pricing` entries. The active tier's windows restart whenever the
+    # tier switches.
+    #
+    # LEGACY STYLE (still fully supported, in case the plan reverts to
+    # request-based limits): omit `limits` and give the tier
+    # window_seconds/window_limit — one requests budget; those fall back to the
+    # top-level rate_window_* below when omitted too.
     "tiers": {
-        "low":  {"max_concurrent": 4,    "window_seconds": 18000, "window_limit": 600},
-        "high": {"max_concurrent": 1000, "window_seconds": 3600,  "window_limit": 99999},
+        "low": {
+            "max_concurrent": 4,
+            "limits": [
+                {"metric": "requests", "limit": 20,     "window_seconds": 60},
+                {"metric": "tokens",   "limit": 500000, "window_seconds": 60},
+                {"metric": "cost",     "limit": 50,     "window_seconds": 60},
+                {"metric": "cost",     "limit": 30,     "window_seconds": 18000},
+            ],
+        },
+        "high": {
+            "max_concurrent": 1000,
+            "limits": [
+                {"metric": "requests", "limit": 1000,   "window_seconds": 60},
+                {"metric": "tokens",   "limit": 500000, "window_seconds": 60},
+                {"metric": "cost",     "limit": 50,     "window_seconds": 60},
+                {"metric": "cost",     "limit": 100,    "window_seconds": 3600},
+            ],
+        },
     },
     "promotion_cooldown_seconds": 300,
     "retry_max_attempts": 12,
@@ -95,9 +125,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # window and run once the quota resets. (retry_max_attempts still bounds
     # connection-error retries, which a long wait won't fix.)
     "retry_max_elapsed_seconds": 18900,
-    # Fallback rolling request-quota window for the dashboard "X / N this window"
-    # indicator, used only when a tier omits its own window_seconds/window_limit.
-    # Tracked, not enforced.
+    # LEGACY fallback rolling request-quota window, used only when a tier has
+    # no `limits` list AND omits its own window_seconds/window_limit. Tracked,
+    # not enforced.
     "rate_window_seconds": 18000,   # 5h
     "rate_window_limit": 600,
     # Per-model weighting for the window count: a request for a listed model
@@ -141,20 +171,74 @@ def load_config_file(path: Path) -> dict[str, Any]:
     return merged
 
 
+def parse_budgets(cfg: dict[str, Any], name: str) -> list[Budget] | None:
+    """Read a tier's `limits` list from config, validated.
+
+    Each entry needs `metric` ("requests" | "tokens" | "cost"), `limit` > 0,
+    and `window_seconds` > 0; invalid entries are dropped with a warning so a
+    bad config line can't silently change the quota tracking. Returns None
+    when the tier has no usable `limits` at all — the caller then falls back
+    to the legacy single request-window keys.
+    """
+    t = (cfg.get("tiers") or {}).get(name) or {}
+    raw = t.get("limits")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        log.warning(f"tiers.{name}.limits must be a list; ignored")
+        return None
+    budgets: list[Budget] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            log.warning(f"tiers.{name}.limits entry {entry!r} not a mapping; ignored")
+            continue
+        metric = str(entry.get("metric", "")).strip().lower()
+        if metric not in BUDGET_METRICS:
+            log.warning(f"tiers.{name}.limits: unknown metric {entry.get('metric')!r}; "
+                        f"expected one of {BUDGET_METRICS}; ignored")
+            continue
+        try:
+            limit = float(entry.get("limit"))
+            window_seconds = float(entry.get("window_seconds"))
+        except (TypeError, ValueError):
+            log.warning(f"tiers.{name}.limits entry {entry!r}: limit/window_seconds "
+                        f"must be numeric; ignored")
+            continue
+        if limit <= 0 or window_seconds <= 0:
+            log.warning(f"tiers.{name}.limits entry {entry!r}: limit and "
+                        f"window_seconds must be > 0; ignored")
+            continue
+        budgets.append(Budget(metric, limit, window_seconds))
+    if not budgets:
+        log.warning(f"tiers.{name}.limits has no valid entries; "
+                    f"falling back to the legacy window keys")
+        return None
+    return budgets
+
+
 def make_tier(cfg: dict[str, Any], name: str) -> Tier:
     """Build a Tier from config.
 
-    Each tier may carry its own `window_seconds` / `window_limit` (its rolling
-    request-quota budget). When omitted they fall back to the top-level
-    `rate_window_seconds` / `rate_window_limit` so older single-window configs
-    keep working.
+    A tier's quota budgets come from its `limits` list (see parse_budgets).
+    Without one, the legacy single request-window style applies: the tier's
+    own `window_seconds` / `window_limit`, falling back to the top-level
+    `rate_window_seconds` / `rate_window_limit`, become one requests budget —
+    so older request-based configs keep working unchanged.
     """
     t = cfg["tiers"][name]
+    budgets = parse_budgets(cfg, name)
+    if budgets is not None and ("window_seconds" in t or "window_limit" in t):
+        log.info(f"tiers.{name}: both 'limits' and legacy window keys set; 'limits' wins")
+    if budgets is None:
+        budgets = [Budget(
+            "requests",
+            float(t.get("window_limit", cfg.get("rate_window_limit", 600))),
+            float(t.get("window_seconds", cfg.get("rate_window_seconds", 18000))),
+        )]
     return Tier(
         name=name,
         max_concurrent=int(t["max_concurrent"]),
-        window_seconds=float(t.get("window_seconds", cfg.get("rate_window_seconds", 18000))),
-        window_limit=int(t.get("window_limit", cfg.get("rate_window_limit", 600))),
+        budgets=budgets,
     )
 
 
@@ -264,6 +348,10 @@ def build_state(config_path: Path | None = None) -> AppState:
         concurrency_reserve=int(cfg.get("auto_concurrency_reserve", 0)),
         human_horizon=float(cfg.get("human_demand_horizon_seconds", 3600)),
     )
+    limiter.set_assumed_units(
+        tokens_per_request=float(cfg.get("auto_assumed_tokens_per_request", 20000)),
+        cost_per_request=float(cfg.get("auto_assumed_cost_per_request", 0.05)),
+    )
     limiter.set_daily_switch(parse_switch_time(cfg.get("scheduled_high_at")))
     limiter.set_daily_low_switch(parse_switch_time(cfg.get("scheduled_low_at")))
     pricing = cfg.get("model_pricing") or {}
@@ -317,6 +405,10 @@ async def apply_config_change(state: AppState, new_cfg: dict[str, Any]) -> None:
     state.limiter.set_auto_params(
         concurrency_reserve=int(new_cfg.get("auto_concurrency_reserve", 0)),
         human_horizon=float(new_cfg.get("human_demand_horizon_seconds", 3600)),
+    )
+    state.limiter.set_assumed_units(
+        tokens_per_request=float(new_cfg.get("auto_assumed_tokens_per_request", 20000)),
+        cost_per_request=float(new_cfg.get("auto_assumed_cost_per_request", 0.05)),
     )
     state.limiter.set_daily_switch(parse_switch_time(new_cfg.get("scheduled_high_at")))
     state.limiter.set_daily_low_switch(parse_switch_time(new_cfg.get("scheduled_low_at")))

@@ -74,6 +74,8 @@ h1 { margin: 0 0 4px 0; font-size: 20px; font-weight: 600; }
 .stat .value.warn { color: var(--yellow); }
 .stat .value.crit { color: var(--red); }
 .stat .sub { color: var(--muted); font-size: 11px; margin-top: 4px; white-space: nowrap; }
+/* The quota budget currently closest to its limit (the "binding" one). */
+.stat.binding { border-color: var(--accent); }
 table {
   width: 100%; border-collapse: collapse; font-size: 13px;
   font-variant-numeric: tabular-nums;

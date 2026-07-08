@@ -17,10 +17,13 @@ Anthropic, OpenAI Chat Completions, and OpenAI Responses `usage` shapes).
 - **Two-tier auto-detection.** Discovers whether upstream is currently allowing
   4 or 1000 concurrent requests by sending a speculative "probe" request when
   the lower cap is saturated.
-- **Per-tier quota windows.** Each tier carries its own rolling request-quota
-  window (LOW `600`/5h, HIGH `99999`/1h by default); the indicator restarts with
-  the right limit + duration whenever the tier switches. Window state is
-  persisted across restarts and can be set by hand over HTTP.
+- **Per-tier quota budgets.** Each tier carries a list of rolling quota windows
+  — **requests, tokens, and/or cost (USD)** per window — all tracked at once
+  (e.g. LOW: 20 req/min + 500k tok/min + $50/min + $30/5h). The most-utilized
+  budget is highlighted as "binding", the indicators restart whenever the tier
+  switches, window state is persisted across restarts, and each window can be
+  set by hand over HTTP. The old single request-window config style still
+  works.
 - **Auto-retry on `429` / `503` / `529`** with `Retry-After` honored.
 - **Hot-reloaded YAML config.** Edit `config.yaml`, save, ~2s later it's live.
 - **Web dashboard** with per-model latency, throughput, tokens, and cost, plus a
@@ -120,7 +123,8 @@ upstream_base_url: "https://your-custom-service.example.com"
 ## Two lanes (human vs automation)
 
 The proxy listens on two ports that share **one** upstream, queue, tier
-auto-detector, and quota window — they differ only in *admission policy*:
+auto-detector, and set of quota windows — they differ only in *admission
+policy*:
 
 | Lane | Port (default) | Policy |
 |---|---|---|
@@ -133,25 +137,34 @@ the second lane entirely (single-port mode).
 
 ### How the automation lane is paced
 
-Every time an automation request arrives, the pacer admits it at a target rate:
+Every time an automation request arrives, the pacer evaluates **every quota
+budget** of the active tier and admits at the rate of the most constraining
+("binding") one. Per budget, in that budget's units (requests, tokens, or $):
 
 ```
-usable = window_limit − used − human_demand_safety · human_rate · time_left − human_quota_floor
-rate   = usable / time_left                       # spread the leftover evenly
-rate   = min(rate, free_slots / avg_request_time) # never outrun the pipe
+usable = limit − used − human_demand_safety · human_rate · units_per_request · time_left
+                − human_quota_floor                        # requests budgets only
+rate   = (usable / units_per_request) / time_left  # spread the leftover evenly
+rate   = min(rate over all budgets, free_slots / avg_request_time)  # never outrun the pipe
 ```
 
 - **`used`** is the whole window's count (human + automation), so the lanes
   compete for one shared budget.
+- **`units_per_request`** converts between requests and tokens/$ — a live EWMA
+  of what one request actually consumes (before any traffic, the
+  `auto_assumed_tokens_per_request` / `auto_assumed_cost_per_request` config
+  values apply). That's how "500k tokens left over 40 minutes" becomes a
+  request rate.
 - **`human_rate`** is the observed human request rate, *averaged over
   `human_demand_horizon_seconds`* so a short human burst isn't extrapolated into
   a giant reservation. `human_demand_safety` (default `1.5`) padding decides how
   much predicted human demand to hold back.
-- As the window nears its end, `time_left → 0`, the predicted-human term
+- As a window nears its end, `time_left → 0`, the predicted-human term
   vanishes, and automation is free to **drain up to 100%** of what's left.
   Early on it holds back exactly what humans are statistically expected to need.
-- If humans have already spent the window down to that prediction, `usable ≤ 0`
-  and automation **parks** until the window advances or resets.
+- If humans have already spent **any** budget down to that prediction,
+  `usable ≤ 0` and automation **parks** until the window advances or resets.
+  The dashboard's Auto Pacing card names the budget that currently binds.
 - `avg_request_time` (the tracked EWMA latency) and the tier's concurrency cap
   set the physical ceiling, so the pacer never schedules faster than requests
   can actually drain. In the low tier that's `max_concurrent` (4) slots.
@@ -165,63 +178,85 @@ quota prediction catches up. All knobs are in
 ## Two-tier model
 
 The proxy assumes upstream allows one of two concurrency caps. Each tier also
-carries its own rolling **request-quota window** (see below):
+carries its own list of rolling **quota budgets** (see below):
 
-| Tier | Max concurrent | Quota window (default) |
+| Tier | Max concurrent | Quota budgets (default) |
 |------|---:|---|
-| `low`  | 4    | `600` requests / 5h |
-| `high` | 1000 | `99999` requests / 1h |
+| `low`  | 4    | 20 req/min · 500k tokens/min · $50/min · **$30 / 5h** |
+| `high` | 1000 | 1000 req/min · 500k tokens/min · $50/min · **$100 / 1h** |
 
-The concurrency cap is enforced (requests queue past it). The quota window is
+The concurrency cap is enforced (requests queue past it). The quota budgets are
 **tracked, not enforced** — if upstream rejects you because a quota is spent,
 you'll see a `429`, and the retry/backoff (below) is what makes callers wait.
 
-### Quota window indicator
+### Quota budget indicators
 
-Each tier has a rolling **request quota** (LOW e.g. 600/5h, HIGH e.g.
-99999/1h). The proxy doesn't enforce it, but tracks it so the dashboard can show
-how far you are into the current window:
+Each budget is `limit` units of a metric per `window_seconds`:
 
-- The window is **anchored at the first request** sent after the previous one
-  expired ("the window starts when the first request goes out"). If you've been
-  idle long enough that the last window elapsed, the next request opens a fresh
-  one.
-- It's **per tier**: whenever the active tier switches (LOW ⇄ HIGH, by
-  auto-detect, boost, or a forced change) the counter **restarts** under the new
-  tier's limit and duration. So promoting to HIGH gives you a fresh `0 / 99999`
-  over 1h, and dropping back to LOW resets to `0 / 600` over 5h.
-- The **Current State** panel shows `count / limit` requests used, time elapsed
-  and time left, and a progress bar; the bar turns yellow/red as you approach
-  the limit.
-- Configure each tier's window with `tiers.<tier>.window_seconds` /
-  `window_limit`. A tier that omits them falls back to the top-level
-  `rate_window_seconds` (default `18000` = 5h) / `rate_window_limit` (`600`).
+- **requests** — weighted request count (see per-model weighting below),
+  counted when the request is admitted.
+- **tokens** — input + output + cache-write + cache-read tokens, counted when
+  the response completes.
+- **cost** — USD priced via `model_pricing`, counted at completion. **A model
+  with no pricing entry contributes $0**, so configure pricing for every model
+  you use if you rely on cost budgets.
 
-**Persisted across restarts.** The current count + start time are written to
+The proxy doesn't enforce them for interactive traffic, but tracks them all so
+the dashboard can show how far you are into each window (the automation lane
+*is* paced against the most constraining budget — see the pacing section):
+
+- Every window is **anchored at the first request** sent after the previous one
+  expired ("the window starts when the first request goes out"), and each rolls
+  **independently** — the 1-minute windows roll hundreds of times inside the 5h
+  cost window.
+- They're **per tier**: whenever the active tier switches (LOW ⇄ HIGH, by
+  auto-detect, boost, or a forced change) all counters **restart** under the
+  new tier's budgets.
+- The **Current State** panel shows one card per budget — `used / limit` in the
+  budget's units, time elapsed/left, per-lane spend and projections, and a
+  progress bar; the most-utilized budget is highlighted as **binding** and is
+  also what the statusline shows.
+- Configure per tier with `tiers.<tier>.limits`, a list of
+  `{metric, limit, window_seconds}` entries (see `config.yaml`). **Legacy
+  style:** a tier without `limits` uses its `window_seconds` / `window_limit`
+  as a single requests budget, falling back to the top-level
+  `rate_window_seconds` / `rate_window_limit` — so old request-based configs
+  keep working as-is.
+
+**Persisted across restarts.** Every window's count + start time is written to
 `window_persist_path` (default `window.json`) every ~5s and on shutdown, then
-restored on boot — **unless** the saved window has already elapsed, in which case
-it's discarded and the next request opens a fresh one.
+restored on boot — windows that already elapsed (or whose budget was removed
+from config) are discarded and start fresh. A `window.json` from an older
+single-window version restores into the requests budget.
 
-**Set it by hand.** Useful after a restart mid-window, or to sync the indicator
-with what upstream actually thinks you've used:
+**Set them by hand.** Useful after a restart mid-window, or to sync an
+indicator with what upstream actually thinks you've used. Optional `metric` /
+`window_seconds` select the budget window (count defaults to the requests
+window; start applies to all windows when unselected):
 
 ```sh
-# Set the current count for the active window
+# Set the current count for the requests window
 curl -X POST http://127.0.0.1:8787/_proxy/window/count \
      -H 'content-type: application/json' -d '{"count": 120}'
 
-# Set (or clear with null) the window start time, as unix seconds
+# Set the 5h cost window's spend to $12.50
+curl -X POST http://127.0.0.1:8787/_proxy/window/count \
+     -H 'content-type: application/json' \
+     -d '{"count": 12.5, "metric": "cost", "window_seconds": 18000}'
+
+# Set (or clear with null) window start times, as unix seconds
 curl -X POST http://127.0.0.1:8787/_proxy/window/start \
      -H 'content-type: application/json' -d '{"started_at": 1733250000}'
 ```
 
 ### Per-model window weighting
 
-A single request can cost more than one unit toward the quota window (e.g. an
-Opus call costing 4× a Haiku call). Set `model_window_weights` (matched by exact
-model name, then substring) and `default_window_weight` in `config.yaml`. This
-affects **only** the window indicator — per-request metrics and per-model stats
-still count every request exactly once.
+A single request can cost more than one unit toward **requests** budgets (e.g.
+an Opus call costing 4× a Haiku call). Set `model_window_weights` (matched by
+exact model name, then substring) and `default_window_weight` in `config.yaml`.
+Token/cost budgets are unaffected (they measure real consumption), and this
+affects **only** the window indicators — per-request metrics and per-model
+stats still count every request exactly once.
 
 ### Surviving a full window (retry budget)
 
@@ -469,19 +504,22 @@ and `listen_port` — those require a restart.
 | `human_quota_floor` | `0` | Hard floor of requests always kept free for humans (0 = purely statistical). |
 | `auto_concurrency_reserve` | `0` | Concurrency slots reserved for humans (auto capped at `max_concurrent −` this). |
 | `auto_assumed_request_seconds` | `30.0` | Assumed request time before latency is measured. |
+| `auto_assumed_tokens_per_request` | `20000` | Assumed tokens/request before any completion is measured (token-budget pacing). |
+| `auto_assumed_cost_per_request` | `0.05` | Assumed USD/request before any completion is measured (cost-budget pacing). |
 | `auto_poll_seconds` | `1.0` | How often a parked/over-pace auto request re-checks. |
 | `initial_tier` | `low` | `low` or `high`. |
 | `force_tier` | `null` | `null` = auto, `"low"` / `"high"` = pin. |
 | `tiers.<tier>.max_concurrent` | `4` / `1000` | Concurrency cap for each tier (`low` / `high`). |
-| `tiers.<tier>.window_seconds` | `18000` / `3600` | Each tier's quota-window length (LOW 5h, HIGH 1h). Falls back to `rate_window_seconds`. |
-| `tiers.<tier>.window_limit` | `600` / `99999` | Requests-per-window shown in the indicator for that tier. Falls back to `rate_window_limit`. |
+| `tiers.<tier>.limits` | new-plan budgets | List of `{metric, limit, window_seconds}` quota budgets; metric is `requests` / `tokens` / `cost`. |
+| `tiers.<tier>.window_seconds` | — | **Legacy** quota-window length (used only without `limits`). Falls back to `rate_window_seconds`. |
+| `tiers.<tier>.window_limit` | — | **Legacy** requests-per-window (used only without `limits`). Falls back to `rate_window_limit`. |
 | `promotion_cooldown_seconds` | `300` | Min seconds between failed probe / demotion and next probe. |
 | `retry_max_attempts` | `12` | Max **connection-error** retries per request. |
 | `retry_base_delay` / `retry_max_delay` | `1.0` / `60.0` | Exponential backoff bounds. |
 | `retry_max_elapsed_seconds` | `18900` | Total time a **rate-limited** request keeps retrying (outlasts the 5h window). |
-| `rate_window_seconds` | `18000` | **Fallback** quota-window length for tiers that don't set their own. |
-| `rate_window_limit` | `600` | **Fallback** requests-per-window for tiers that don't set their own. |
-| `model_window_weights` / `default_window_weight` | `{}` / `1` | Per-model units charged to the window indicator (only). |
+| `rate_window_seconds` | `18000` | **Legacy fallback** quota-window length for tiers with neither `limits` nor their own window keys. |
+| `rate_window_limit` | `600` | **Legacy fallback** requests-per-window for those tiers. |
+| `model_window_weights` / `default_window_weight` | `{}` / `1` | Per-model units charged to **requests** budgets (indicator only). |
 | `window_persist_path` | `window.json` | File for the persisted current quota-window state. |
 | `upstream_timeout` | `600` | Per-request timeout (s). |
 | `log_level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. |

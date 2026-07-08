@@ -68,11 +68,24 @@ def test_window_save_load_roundtrip(tmp_path):
     lim = _limiter_with_window()
     save_window_file(lim, path)
     state = load_window_file(path)
-    assert state is not None and state["count"] == 1.0
+    assert state is not None and state["version"] == 2
+    assert state["windows"][0]["count"] == 1.0
     fresh = Limiter(Tier("low", 4, 100, 10), Tier("high", 100, 50, 99),
                     "low", 300.0, None)
     assert fresh.load_window_state(state)
     assert fresh.window_snapshot()["count_auto"] == 1
+
+
+def test_legacy_window_file_still_loads(tmp_path):
+    # Pre-budgets window.json: a single flat window dict. Must restore into the
+    # requests budget so an upgrade doesn't drop the running window.
+    legacy = {"started_at": time.time() - 10, "count": 5, "count_human": 3,
+              "count_auto": 2, "tier": "low", "window_seconds": 100}
+    fresh = Limiter(Tier("low", 4, 100, 10), Tier("high", 100, 50, 99),
+                    "low", 300.0, None)
+    assert fresh.load_window_state(legacy)
+    snap = fresh.window_snapshot()
+    assert snap["count"] == 5 and snap["count_auto"] == 2 and snap["count_human"] == 3
 
 
 def test_window_save_clears_file_when_idle(tmp_path):

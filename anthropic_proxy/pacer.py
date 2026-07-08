@@ -17,22 +17,31 @@ if TYPE_CHECKING:
 
 
 class AutoPacer:
-    """Paces the automation lane to spend only the *leftover* quota window.
+    """Paces the automation lane to spend only the *leftover* quota.
 
     The human lane is never paced. Automation is admitted at a rate that spreads
     its share of the window evenly, but the share is computed against *predicted
-    future human demand* rather than a fixed reserve:
+    future human demand* rather than a fixed reserve. With multiple budgets per
+    tier (requests / tokens / cost, each its own window) every budget is
+    evaluated and the **binding** (most constraining) one sets the pace. Per
+    budget, in that budget's units:
 
-        usable   = window_limit - used - safety * human_rate * remaining - floor
-        rate     = usable / remaining            (requests/sec to even-spread)
-        rate     = min(rate, free_slots / avg)   (never schedule faster than the
-                                                   pipe can drain — uses tracked
-                                                   avg request time + tier slots)
+        usable_units = limit - used - safety * human_rate * units_per_req
+                                              * min(remaining, lookahead)
+                       - floor            (floor only for requests budgets)
+        usable_reqs  = usable_units / units_per_req
+        rate         = usable_reqs / remaining   (requests/sec to even-spread)
 
-    As the window nears its end, `remaining -> 0`, the predicted-human term
+    `units_per_req` converts between requests and the budget's units (1 for
+    requests; a live EWMA of tokens/cost per request otherwise, with configured
+    assumed values before any data). The final rate is the minimum across
+    budgets, additionally capped by physical throughput
+    (free slots / avg request time).
+
+    As a window nears its end, `remaining -> 0`, the predicted-human term
     vanishes, and automation is free to drain whatever is left (up to ~100%).
     Early on, it holds back exactly what humans are statistically expected to
-    still need. If humans have already consumed the window down to that
+    still need. If humans have already consumed any budget down to that
     prediction, `usable <= 0` and automation parks until the window advances or
     resets. Gating is serialized so the average admission rate is honored;
     concurrency is still bounded separately by the Limiter (with human priority).
@@ -65,38 +74,89 @@ class AutoPacer:
                           cfg.get("human_demand_horizon_seconds", 3600))),
         )
 
-    def _usable_and_rate(self) -> tuple[float, float]:
-        """Return (usable_requests, target_rate_per_sec) for automation now."""
+    def _evaluate(self) -> dict[str, Any]:
+        """Evaluate every budget window and pick the binding (slowest) one.
+
+        Returns {usable, rate, binding, windows} where `usable` is in REQUESTS
+        (the binding budget's leftover converted via units_per_request),
+        `rate` is the final requests/sec (inf = open), `binding` is the index
+        of the binding window in the limiter snapshot (None when open), and
+        `windows` has one entry per snapshot window (None for windows that
+        can't constrain: inactive, about to roll, or unpriced-cost) with
+        {metric, window_seconds, usable_units, usable_reqs, rate, count_auto}.
+        """
         snap = self._limiter.window_snapshot()
-        if not snap["active"]:
-            # No window open yet — the first request anchors it; let it through.
-            return 1.0, float("inf")
-        # `effective_remaining_seconds` already folds in a pending LOW->HIGH
-        # switch (the window snapshot caps it at the switch time), so the leftover
-        # drains over the shorter horizon and the predicted-human term shrinks
-        # with it. Fall back to the true remaining if the field is absent.
-        remaining = float(
-            snap.get("effective_remaining_seconds")
-            if snap.get("effective_remaining_seconds") is not None
-            else snap.get("remaining_seconds") or 0.0
-        )
-        if remaining <= 0:
-            return 1.0, float("inf")  # window about to roll; drain freely
-        limit = float(snap["limit"])
-        used = float(snap["count"])
-        # Project the measured human rate forward only up to _lookahead, not
-        # across the whole (possibly multi-hour) remaining window — otherwise a
-        # small human rate reserves nearly the entire quota on a long window.
-        horizon = min(remaining, self._lookahead)
-        expected_human = self._safety * self._limiter.human_rate() * horizon
-        usable = limit - used - expected_human - self._floor
-        if usable <= 0:
-            return usable, 0.0
-        rate = usable / remaining
+        wins = snap.get("windows") or []
+        human_rate = self._limiter.human_rate()
+        entries: list[dict[str, Any] | None] = []
+        binding: int | None = None
+        for i, w in enumerate(wins):
+            if not w.get("active"):
+                entries.append(None)  # dormant — the first request anchors it
+                continue
+            metric = str(w.get("metric", "requests"))
+            units_per_req = self._limiter.units_per_request(metric)
+            if units_per_req <= 0:
+                # Can't convert this budget into requests — e.g. a cost budget
+                # with no model_pricing configured (its count never rises
+                # either). It can never bind.
+                entries.append(None)
+                continue
+            # `effective_remaining_seconds` already folds in a pending LOW->HIGH
+            # switch (the window snapshot caps it at the switch time), so the
+            # leftover drains over the shorter horizon and the predicted-human
+            # term shrinks with it.
+            remaining = float(
+                w.get("effective_remaining_seconds")
+                if w.get("effective_remaining_seconds") is not None
+                else w.get("remaining_seconds") or 0.0
+            )
+            if remaining <= 0:
+                entries.append(None)  # about to roll; drains freely
+                continue
+            limit = float(w["limit"])
+            used = float(w["count"])
+            # Project the measured human rate forward only up to _lookahead, not
+            # across the whole (possibly multi-hour) remaining window — otherwise
+            # a small human rate reserves nearly the entire quota on a long
+            # window.
+            horizon = min(remaining, self._lookahead)
+            expected_human = self._safety * human_rate * units_per_req * horizon
+            # human_quota_floor is a request count; it applies only to requests
+            # budgets rather than being converted into token/cost floors.
+            floor_units = self._floor if metric == "requests" else 0.0
+            usable_units = limit - used - expected_human - floor_units
+            usable_reqs = usable_units / units_per_req
+            rate = usable_reqs / remaining if usable_reqs > 0 else 0.0
+            entries.append({
+                "metric": metric,
+                "window_seconds": float(w.get("window_seconds") or 0.0),
+                "usable_units": usable_units,
+                "usable_reqs": usable_reqs,
+                "rate": rate,
+                "count_auto": float(w.get("count_auto", 0) or 0),
+            })
+            if binding is None or rate < entries[binding]["rate"]:
+                binding = i
+        if binding is None:
+            # No budget can constrain right now — let the request through (it
+            # anchors the windows).
+            return {"usable": 1.0, "rate": float("inf"), "binding": None,
+                    "windows": entries}
+        b = entries[binding]
+        if b["usable_reqs"] <= 0:
+            return {"usable": b["usable_reqs"], "rate": 0.0, "binding": binding,
+                    "windows": entries}
         # Cap by physical throughput: free slots / avg request time.
         avg = self._metrics.avg_duration(self._assumed)
         capacity = max(1, self._limiter.active.max_concurrent) / max(0.1, avg)
-        return usable, min(rate, capacity)
+        return {"usable": b["usable_reqs"], "rate": min(b["rate"], capacity),
+                "binding": binding, "windows": entries}
+
+    def _usable_and_rate(self) -> tuple[float, float]:
+        """Return (usable_requests, target_rate_per_sec) for automation now."""
+        ev = self._evaluate()
+        return ev["usable"], ev["rate"]
 
     async def gate(self) -> None:
         """Block until the calling automation request may proceed."""
@@ -143,14 +203,24 @@ class AutoPacer:
         `next_seconds` is the wait until the next one may go (None when parked on
         human-reserved quota — that releases when the window advances/resets, not
         on a fixed timer). `reason` is one of disabled/open/paced/reserved.
+        `usable` is in requests (the binding budget's leftover converted via
+        units_per_request); `windows` mirrors the limiter snapshot's windows by
+        index with each budget's leftover + auto projection in its OWN units, so
+        the dashboard can annotate every quota meter; `binding_metric` /
+        `binding_window_seconds` identify the budget that currently sets the
+        pace. Top-level count_auto/projected_auto stay in the snapshot's
+        binding-window units to match the mirror fields there.
         """
         snap = self._limiter.window_snapshot()
         count_auto = float(snap.get("count_auto", 0) or 0)
         if not self._enabled:
             return {"enabled": False, "parked": self._parked, "usable": None,
                     "rate_per_min": None, "next_seconds": None, "reason": "disabled",
-                    "count_auto": round(count_auto, 2), "projected_auto": round(count_auto, 2)}
-        usable, rate = self._usable_and_rate()
+                    "count_auto": round(count_auto, 2), "projected_auto": round(count_auto, 2),
+                    "binding_metric": None, "binding_window_seconds": None,
+                    "windows": []}
+        ev = self._evaluate()
+        usable, rate = ev["usable"], ev["rate"]
         inf = rate == float("inf")
         if usable <= 0 or rate <= 0:
             reason, next_s, rpm = "reserved", None, 0.0
@@ -161,12 +231,35 @@ class AutoPacer:
             reason = "paced"
             next_s = max(0.0, self._next - now) if self._parked else 0.0
             rpm = round(rate * 60.0, 2)
-        # Estimated background total by window end = spent so far + remaining
-        # usable budget (only when there's a real active window to project into).
-        if snap.get("active") and reason in ("paced", "reserved"):
-            projected_auto = count_auto + max(0.0, usable)
+        # Per-budget view, aligned by index with the limiter snapshot's windows.
+        # projected_auto per window = spent so far + remaining usable budget in
+        # that window's units (only while there's a real budget to project into).
+        projecting = reason in ("paced", "reserved")
+        windows_status: list[dict[str, Any]] = []
+        for i, w in enumerate(snap.get("windows") or []):
+            e = ev["windows"][i] if i < len(ev["windows"]) else None
+            ca = float(w.get("count_auto", 0) or 0)
+            if e is not None and w.get("active") and projecting:
+                pa = ca + max(0.0, e["usable_units"])
+            else:
+                pa = ca
+            windows_status.append({
+                "metric": w.get("metric"),
+                "window_seconds": w.get("window_seconds"),
+                "usable_units": round(e["usable_units"], 4) if e is not None else None,
+                "projected_auto": round(pa, 4),
+            })
+        pace_binding = ev["binding"]
+        binding_metric = binding_ws = None
+        if pace_binding is not None and pace_binding < len(windows_status):
+            binding_metric = windows_status[pace_binding]["metric"]
+            binding_ws = windows_status[pace_binding]["window_seconds"]
+        # Top-level projection follows the snapshot's binding (mirror) window.
+        mirror_i = snap.get("binding", 0) or 0
+        if 0 <= mirror_i < len(windows_status):
+            projected_auto = windows_status[mirror_i]["projected_auto"]
         else:
-            projected_auto = count_auto
+            projected_auto = count_auto + max(0.0, usable) if (snap.get("active") and projecting) else count_auto
         return {
             "enabled": True,
             "parked": self._parked,
@@ -176,4 +269,7 @@ class AutoPacer:
             "reason": reason,
             "count_auto": round(count_auto, 2),
             "projected_auto": round(projected_auto, 2),
+            "binding_metric": binding_metric,
+            "binding_window_seconds": binding_ws,
+            "windows": windows_status,
         }

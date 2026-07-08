@@ -123,6 +123,17 @@ class Metrics:
     def _cost(self, model: str, in_t: int, out_t: int, cc_t: int, cr_t: int) -> float | None:
         return compute_cost(self._pricing, model, in_t, out_t, cc_t, cr_t)
 
+    def cost_of(self, model: str, usage: dict | None) -> float | None:
+        """Priced cost of one request's usage dict (None when model unpriced)."""
+        u = usage or {}
+        return self._cost(
+            model,
+            int(u.get("input_tokens", 0) or 0),
+            int(u.get("output_tokens", 0) or 0),
+            int(u.get("cache_creation_input_tokens", 0) or 0),
+            int(u.get("cache_read_input_tokens", 0) or 0),
+        )
+
     def summary(self) -> dict[str, Any]:
         now = time.time()
         cutoff = now - self._max_age
