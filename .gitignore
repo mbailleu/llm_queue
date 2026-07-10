@@ -9,3 +9,7 @@ stats.json.tmp
 # Persisted rolling-window state
 window.json
 window.json.tmp
+
+# Persisted price-calibration snapshots
+calibration.json
+calibration.json.tmp

@@ -17,6 +17,7 @@ from typing import Any
 
 import yaml
 
+from .calibrate import Calibrator
 from .limiter import BUDGET_METRICS, Budget, Limiter, Tier
 from .metrics import Metrics
 from .pacer import AutoPacer
@@ -149,6 +150,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Current rolling-window state (count + start) persisted across restarts.
     # Restored on boot unless it has already elapsed past its window.
     "window_persist_path": "window.json",
+    # Price-calibration snapshots (upstream cumulative cost counters paired
+    # with the proxy's own per-model token counters at that moment), persisted
+    # so estimates keep improving across restarts. See POST
+    # /_proxy/calibrate/snapshot and GET /_proxy/calibrate/prices.
+    "calibration_persist_path": "calibration.json",
 }
 
 
@@ -369,9 +375,11 @@ def build_state(config_path: Path | None = None) -> AppState:
         persist=pstats,
     )
     pacer = AutoPacer(limiter, metrics, cfg)
+    calibrator = Calibrator(str(cfg.get("calibration_persist_path", "calibration.json")))
     state = AppState(
         config=cfg, config_path=path, config_mtime=mtime,
         limiter=limiter, metrics=metrics, pstats=pstats, pacer=pacer,
+        calibrator=calibrator,
     )
     limiter.load_window_state(load_window_file(state.window_persist_path()))
     return state
@@ -422,6 +430,8 @@ async def apply_config_change(state: AppState, new_cfg: dict[str, Any]) -> None:
         flush_seconds=float(new_cfg.get("stats_flush_seconds", 60.0)),
         retention_days=float(new_cfg.get("stats_retention_days", 120)),
     )
+    state.calibrator.configure(
+        str(new_cfg.get("calibration_persist_path", "calibration.json")))
     state.config = new_cfg
     log.info(f"config reloaded from {state.config_path} (force_tier={forced})")
 

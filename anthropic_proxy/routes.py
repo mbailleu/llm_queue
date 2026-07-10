@@ -12,6 +12,7 @@ from pathlib import Path
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
+from .calibrate import COST_KEYS
 from .config import apply_config_change, parse_switch_time
 from .metrics import METRIC_WINDOWS
 from .persistence import save_window_file
@@ -290,6 +291,70 @@ async def schedule_low_endpoint(req: Request):
       curl -X POST localhost:8787/_proxy/schedule_low -d '{"at": "09:00"}'
     """
     return await _set_oneshot_switch(req, "low")
+
+
+# ---------- price calibration ----------
+
+@router.post("/_proxy/calibrate/snapshot")
+async def calibrate_snapshot_endpoint(req: Request):
+    """Record one price-calibration snapshot.
+
+    Body: the provider's CUMULATIVE cost counters (since your plan changed),
+    all in the provider's billing unit (USD):
+      {"cost_input_uncached": X, "cost_input_cached": Y, "cost_output": Z}
+    The proxy pairs them with its own cumulative per-model token counters at
+    this moment and persists the pair. Take another snapshot whenever
+    convenient (irregular intervals are fine); every consecutive pair becomes
+    one calibration interval. Intervals where the model mix differs — ideally
+    some where only one model ran — are what make per-model prices solvable.
+    Example:
+      curl -X POST localhost:8787/_proxy/calibrate/snapshot \\
+           -d '{"cost_input_uncached": 12.31, "cost_input_cached": 0.85, "cost_output": 7.02}'
+    """
+    st = _st(req)
+    try:
+        body = await req.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    costs = {}
+    for k in COST_KEYS:
+        if k not in body:
+            return JSONResponse(
+                {"error": f"missing '{k}' (need all of: {', '.join(COST_KEYS)})"},
+                status_code=400,
+            )
+        try:
+            costs[k] = float(body[k])
+        except (TypeError, ValueError):
+            return JSONResponse({"error": f"'{k}' must be a number"}, status_code=400)
+        if costs[k] < 0:
+            return JSONResponse({"error": f"'{k}' must be >= 0"}, status_code=400)
+    snap = st.calibrator.add_snapshot(costs, st.pstats.lifetime_tokens())
+    return {"snapshots": st.calibrator.snapshot_count(), "recorded": snap}
+
+
+@router.get("/_proxy/calibrate/prices")
+async def calibrate_prices_endpoint(req: Request):
+    """Solve all stored snapshots into per-model $/Mtok price estimates.
+
+    Per model+class: a price with confidence "direct" (an interval isolated
+    it), "regression" (joint least squares), or null/"unidentifiable" (the
+    data can't separate it yet — vary the model mix between snapshots).
+    `model_pricing_yaml` is a ready-to-paste config block; `residuals` show
+    how much upstream cost the proxy's traffic explains (persistently
+    unexplained cost = something is spending quota without going through the
+    proxy, or a price changed — POST /_proxy/calibrate/reset then).
+    """
+    return _st(req).calibrator.solve()
+
+
+@router.post("/_proxy/calibrate/reset")
+async def calibrate_reset_endpoint(req: Request):
+    """Drop all calibration snapshots (e.g. the provider reset its counters
+    or changed prices again)."""
+    return {"discarded": _st(req).calibrator.reset()}
 
 
 def _window_selectors(body: dict) -> tuple[str | None, float | None] | JSONResponse:

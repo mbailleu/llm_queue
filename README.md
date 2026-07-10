@@ -36,10 +36,11 @@ Anthropic, OpenAI Chat Completions, and OpenAI Responses `usage` shapes).
 
 ```
 anthropic_proxy/  the application package
-  limiter.py        concurrency tiers, queue, lanes, quota window
+  limiter.py        concurrency tiers, queue, lanes, quota windows
   pacer.py          automation-lane pacing
   usage.py          provider usage parsing (Anthropic + OpenAI shapes)
   metrics.py        rolling metrics + pricing
+  calibrate.py      per-model price calibration from upstream cost counters
   persistence.py    stats.json + window.json
   config.py         defaults, loading, hot-reload
   server.py         FastAPI app, proxy handler, dual-port serve()
@@ -52,6 +53,7 @@ pyproject.toml    package metadata + deps (`pip install -e .`)
 tests/            unit tests for the pure modules
 stats.json        persisted long-horizon stats (auto-created; git-ignored)
 window.json       persisted current quota-window state (auto-created; git-ignored)
+calibration.json  persisted price-calibration snapshots (auto-created; git-ignored)
 ```
 
 ## Run it
@@ -257,6 +259,45 @@ exact model name, then substring) and `default_window_weight` in `config.yaml`.
 Token/cost budgets are unaffected (they measure real consumption), and this
 affects **only** the window indicators — per-request metrics and per-model
 stats still count every request exactly once.
+
+### Calibrating `model_pricing` from your provider's bill
+
+Cost budgets and the dashboard's cost columns are only as good as
+`model_pricing` — and providers don't always publish per-model rates. If your
+provider's console shows **cumulative cost counters** (uncached input, cached
+input, output — e.g. "since your plan changed"), the proxy can derive the
+per-model $/Mtok rates for you: it already records per-model token counts by
+class, so pairing its counters with the provider's cost counters over a few
+intervals makes the prices solvable.
+
+The dashboard's **⚖ Calibrate** button opens a form for exactly this — enter
+the three numbers, hit *Record snapshot*, and the derived per-model estimates
+(with a paste-ready `model_pricing` block) appear right in the dialog. The
+same thing over HTTP — record a snapshot whenever convenient (irregular
+intervals are fine):
+
+```sh
+curl -X POST http://127.0.0.1:8787/_proxy/calibrate/snapshot \
+     -H 'content-type: application/json' \
+     -d '{"cost_input_uncached": 12.31, "cost_input_cached": 0.85, "cost_output": 7.02}'
+```
+
+then read the estimates:
+
+```sh
+curl http://127.0.0.1:8787/_proxy/calibrate/prices | jq
+```
+
+Each price comes with a confidence — `direct` (some interval isolated that
+model), `regression` (solved jointly across mixed-traffic intervals), or
+`unidentifiable` (the data can't separate it yet: vary the model mix between
+snapshots, ideally with some single-model stretches). The response includes a
+ready-to-paste `model_pricing_yaml` block for `config.yaml` (hot-reloaded),
+and per-counter residuals — persistently *unexplained* cost means something is
+spending your quota without going through the proxy, or a price changed
+(`POST /_proxy/calibrate/reset` drops the history to start over). Snapshots
+persist in `calibration.json`, and an interval where a counter went backwards
+(provider reset) is skipped automatically.
 
 ### Surviving a full window (retry budget)
 
@@ -521,6 +562,7 @@ and `listen_port` — those require a restart.
 | `rate_window_limit` | `600` | **Legacy fallback** requests-per-window for those tiers. |
 | `model_window_weights` / `default_window_weight` | `{}` / `1` | Per-model units charged to **requests** budgets (indicator only). |
 | `window_persist_path` | `window.json` | File for the persisted current quota-window state. |
+| `calibration_persist_path` | `calibration.json` | File for persisted price-calibration snapshots. |
 | `upstream_timeout` | `600` | Per-request timeout (s). |
 | `log_level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. |
 | `config_poll_seconds` | `2.0` | How often `config.yaml` is checked. |

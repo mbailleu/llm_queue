@@ -28,6 +28,7 @@
     </div>
     <div style="display:flex; align-items:baseline; gap:12px;">
       <button id="theme-btn" title="Theme: Auto follows your system; click to cycle Auto → Light → Dark">🖥 Auto</button>
+      <button id="calibrate-btn" title="Record your provider's cumulative cost counters to derive per-model $/Mtok prices">⚖ Calibrate</button>
       <button id="boost-btn" title="Temporarily switch to HIGH; auto-demotes to LOW on the first rate-limit">⚡ Boost HIGH</button>
       <div id="live">connecting…</div>
     </div>
@@ -91,6 +92,37 @@
     <a href="/_proxy/status">limiter status</a>
   </div>
 </div>
+<!-- Price-calibration dialog: record the provider's CUMULATIVE cost counters;
+     the proxy pairs them with its own per-model token counters and solves for
+     per-model $/Mtok prices (see /_proxy/calibrate/*). -->
+<dialog id="calibrate-dialog">
+  <h2>Price calibration</h2>
+  <p class="dialog-hint">
+    Enter your provider's <strong>cumulative</strong> cost counters (USD, e.g.
+    "since your plan changed"), exactly as its console shows them right now.
+    Each snapshot is paired with the proxy's own per-model token counters;
+    after two or more, per-model $/Mtok prices can be derived.
+  </p>
+  <form id="calibrate-form" method="dialog">
+    <label>Uncached input cost ($)
+      <input type="number" id="cal-input-uncached" step="any" min="0" required placeholder="e.g. 12.31" />
+    </label>
+    <label>Cached input cost ($)
+      <input type="number" id="cal-input-cached" step="any" min="0" required placeholder="e.g. 0.85" />
+    </label>
+    <label>Output cost ($)
+      <input type="number" id="cal-output" step="any" min="0" required placeholder="e.g. 7.02" />
+    </label>
+    <div id="calibrate-error" class="dialog-error"></div>
+    <div class="dialog-actions">
+      <button type="button" id="calibrate-reset" title="Drop all stored snapshots (provider counters reset / prices changed)">Reset history</button>
+      <span style="flex:1"></span>
+      <button type="button" id="calibrate-cancel">Close</button>
+      <button type="submit" id="calibrate-save">Record snapshot</button>
+    </div>
+  </form>
+  <div id="calibrate-results"></div>
+</dialog>
 <script src="/_proxy/static/app.js"></script>
 </body>
 </html>

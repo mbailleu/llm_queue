@@ -474,6 +474,123 @@ document.getElementById("boost-btn").addEventListener("click", async () => {
   }
   tick();
 });
+// ---- Price-calibration dialog: record the provider's cumulative cost
+// counters (POST /_proxy/calibrate/snapshot) and show the derived per-model
+// $/Mtok estimates (GET /_proxy/calibrate/prices).
+const calDialog = document.getElementById("calibrate-dialog");
+const calError = document.getElementById("calibrate-error");
+const calResults = document.getElementById("calibrate-results");
+function renderCalibration(data) {
+  let html = `<h3>${data.snapshots} snapshot${data.snapshots === 1 ? "" : "s"} · ${data.intervals} interval${data.intervals === 1 ? "" : "s"}</h3>`;
+  const models = Object.keys(data.models || {}).sort();
+  if (models.length === 0) {
+    html += `<div class="empty">No prices derivable yet — record a snapshot now, let some traffic flow, then record another.</div>`;
+  } else {
+    const cell = (p, k) => {
+      const e = p[k];
+      if (!e) return "<td>—</td>";  // no tokens of this class seen yet
+      if (e.price === null || e.price === undefined) {
+        return `<td><span class="conf">unidentifiable</span></td>`;
+      }
+      return `<td>$${e.price}<div class="conf ${e.confidence}">${e.confidence}</div></td>`;
+    };
+    html += "<table><tr><th>Model</th><th>Input</th><th>Cache write</th><th>Cache read</th><th>Output</th></tr>";
+    for (const m of models) {
+      const p = data.models[m];
+      html += `<tr><td>${m}</td>${cell(p, "input")}${cell(p, "cache_creation")}${cell(p, "cache_read")}${cell(p, "output")}</tr>`;
+    }
+    html += "</table>";
+  }
+  const unexplained = Object.values(data.residuals || {})
+    .reduce((s, r) => s + (r.unexplained || 0), 0);
+  if (Math.abs(unexplained) >= 0.01) {
+    html += `<div class="note">⚠ ${fmtCost(Math.abs(unexplained))} of upstream cost ${unexplained > 0 ? "not explained by proxy traffic (something bypassing the proxy?)" : "over-explained (a price may have dropped)"}</div>`;
+  }
+  for (const n of data.notes || []) html += `<div class="note">⚠ ${n}</div>`;
+  if (data.model_pricing_yaml) {
+    html += `<h3>Paste into config.yaml (hot-reloads)</h3><pre>${data.model_pricing_yaml}</pre>`;
+  }
+  calResults.innerHTML = html;
+}
+async function loadCalibration() {
+  try {
+    const r = await fetch("/_proxy/calibrate/prices");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    renderCalibration(await r.json());
+  } catch (e) {
+    calResults.innerHTML = `<div class="err">could not load estimates: ${e.message}</div>`;
+  }
+}
+document.getElementById("calibrate-btn").addEventListener("click", () => {
+  calError.textContent = "";
+  calDialog.showModal();
+  loadCalibration();
+});
+document.getElementById("calibrate-cancel").addEventListener("click", () => calDialog.close());
+// Reset is two-step (click again to confirm) instead of a blocking confirm().
+const calResetBtn = document.getElementById("calibrate-reset");
+let calResetTimer = null;
+calResetBtn.addEventListener("click", async () => {
+  if (!calResetBtn.dataset.armed) {
+    calResetBtn.dataset.armed = "1";
+    calResetBtn.textContent = "Really reset?";
+    calResetTimer = setTimeout(() => {
+      delete calResetBtn.dataset.armed;
+      calResetBtn.textContent = "Reset history";
+    }, 4000);
+    return;
+  }
+  clearTimeout(calResetTimer);
+  delete calResetBtn.dataset.armed;
+  calResetBtn.textContent = "Reset history";
+  try {
+    const r = await fetch("/_proxy/calibrate/reset", { method: "POST" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    loadCalibration();
+  } catch (e) {
+    calError.textContent = "reset failed: " + e.message;
+  }
+});
+document.getElementById("calibrate-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();  // keep the dialog open and show the updated estimates
+  calError.textContent = "";
+  const fields = [
+    ["cost_input_uncached", "cal-input-uncached"],
+    ["cost_input_cached", "cal-input-cached"],
+    ["cost_output", "cal-output"],
+  ];
+  const body = {};
+  for (const [key, id] of fields) {
+    const v = parseFloat(document.getElementById(id).value);
+    if (!Number.isFinite(v) || v < 0) {
+      calError.textContent = "all three costs must be numbers ≥ 0";
+      return;
+    }
+    body[key] = v;
+  }
+  const save = document.getElementById("calibrate-save");
+  save.disabled = true;
+  try {
+    const r = await fetch("/_proxy/calibrate/snapshot", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      throw new Error(e.error || "HTTP " + r.status);
+    }
+    const res = await r.json();
+    calError.textContent = "";
+    ev.target.reset();
+    calResults.innerHTML = `<div class="ok">✓ snapshot #${res.snapshots} recorded</div>`;
+    loadCalibration();
+  } catch (e) {
+    calError.textContent = "snapshot failed: " + e.message;
+  } finally {
+    save.disabled = false;
+  }
+});
 tick();
 setInterval(tick, 2000);
 drawSeries();

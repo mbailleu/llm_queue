@@ -108,14 +108,59 @@ th {
 .empty { color: var(--muted); font-style: italic; text-align: center; padding: 12px; }
 .err { color: var(--red); }
 .ok { color: var(--green); }
-#boost-btn, #theme-btn {
+#boost-btn, #theme-btn, #calibrate-btn {
   background: var(--panel); color: var(--text);
   border: 1px solid var(--border); border-radius: 6px;
   padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
 }
 #boost-btn:hover:not(:disabled) { border-color: var(--green); color: var(--green); }
 #boost-btn:disabled { opacity: 0.5; cursor: default; }
-#theme-btn:hover { border-color: var(--accent); color: var(--accent); }
+#theme-btn:hover, #calibrate-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ---- price-calibration dialog ---- */
+#calibrate-dialog {
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 20px; width: min(560px, 92vw);
+}
+#calibrate-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+#calibrate-dialog h2 { font-size: 14px; margin-bottom: 8px; }
+.dialog-hint { color: var(--muted); font-size: 12px; margin-bottom: 14px; line-height: 1.5; }
+#calibrate-form label {
+  display: block; font-size: 12px; color: var(--muted); margin-bottom: 10px;
+}
+#calibrate-form input {
+  display: block; width: 100%; margin-top: 4px; padding: 6px 8px;
+  background: var(--card-bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  font-size: 13px; font-variant-numeric: tabular-nums;
+}
+#calibrate-form input:focus { outline: none; border-color: var(--accent); }
+.dialog-error { color: var(--red); font-size: 12px; min-height: 16px; margin-bottom: 4px; }
+.dialog-actions { display: flex; gap: 8px; align-items: center; }
+.dialog-actions button {
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.dialog-actions button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.dialog-actions button:disabled { opacity: 0.5; cursor: default; }
+#calibrate-save { background: var(--accent-tint); color: var(--accent); border-color: var(--accent); }
+#calibrate-reset:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
+#calibrate-results { margin-top: 14px; font-size: 12px; }
+#calibrate-results h3 {
+  font-size: 10px; color: var(--muted); text-transform: uppercase;
+  letter-spacing: 0.7px; margin: 10px 0 6px;
+}
+#calibrate-results table { font-size: 12px; }
+#calibrate-results .conf { color: var(--muted); font-size: 11px; }
+#calibrate-results .conf.direct { color: var(--green); }
+#calibrate-results pre {
+  background: var(--card-bg); border: 1px solid var(--card-border);
+  border-radius: 6px; padding: 8px; overflow-x: auto; font-size: 11px;
+  line-height: 1.5; margin-top: 6px;
+}
+#calibrate-results .note { color: var(--yellow); }
 .panel-head {
   display: flex; justify-content: space-between; align-items: center;
   margin-bottom: 12px;

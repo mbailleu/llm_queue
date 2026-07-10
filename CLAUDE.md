@@ -33,7 +33,8 @@ actually pace the client.
 | `proxy.py` | Thin shim (keeps the PEP 723 `# /// script` header) re-exporting `app`/`main` from `anthropic_proxy.server`, so `uv run proxy.py` and `uvicorn proxy:app` still work. |
 | `config.yaml` | Runtime config. **Hot-reloaded** (polled every `config_poll_seconds`). Heavily commented — read it for the meaning of every knob. |
 | `stats.json` | Disk-persisted long-horizon stats (gitignored). Written by `PersistentStats`. |
-| `window.json` | Disk-persisted current rolling-window state — request count + start time (gitignored). Restored on boot unless already elapsed. |
+| `window.json` | Disk-persisted current rolling-window state — one entry per budget window (gitignored). Restored on boot unless already elapsed. |
+| `calibration.json` | Disk-persisted price-calibration snapshots (gitignored). Written by `Calibrator`. |
 | `statusline.sh` | Polls `/_proxy/statusline` for a compact tmux / Claude Code / zellij / wezterm status bar line. |
 | `pyproject.toml` | Package metadata, deps, `anthropic-proxy` console script, pytest config. |
 | `tests/` | Unit tests for the pure modules (`.venv/bin/python -m pytest`). |
@@ -46,7 +47,8 @@ since they drift on every edit.
 
 ### `state.py` — AppState
 One dataclass holding everything the running proxy needs: `config`,
-`config_path`/`config_mtime`, `limiter`, `metrics`, `pstats`, `pacer`, the
+`config_path`/`config_mtime`, `limiter`, `metrics`, `pstats`, `pacer`,
+`calibrator`, the
 shared httpx `client`, and `bg_tasks`. The FastAPI app stores it at
 `app.state.proxy`; routes and the proxy handler read it from there. There are
 **no module globals** — this is what makes every other module importable and
@@ -210,6 +212,25 @@ testable on its own.
   `projected_auto` follows the snapshot's binding window. `configure()` is
   re-called on config reload. The human lane never touches the pacer.
 
+### `calibrate.py` — per-model price calibration (pure, no FastAPI)
+- `Calibrator`: stores snapshots pairing the provider's **cumulative cost
+  counters** (uncached input / cached input / output, since the plan changed)
+  with the proxy's own cumulative per-model token counters
+  (`PersistentStats.lifetime_tokens()`), persisted to `calibration.json`
+  (`calibration_persist_path`). Consecutive snapshot pairs become intervals;
+  `solve()` estimates per-model $/Mtok prices by least squares — one linear
+  system per upstream cost counter, with cache writes as a second unknown
+  inside the uncached-input equation (the provider bills them there). Prices
+  come back with a confidence: `direct` (an interval isolated that model),
+  `regression` (joint solve), or `unidentifiable` (rank-deficient — e.g. two
+  models always in the same ratio). Cumulative counters mean the baselines
+  cancel in deltas; an interval where any counter went backwards
+  (plan/stats reset) is skipped. `solve()` also reports per-counter
+  residuals (unexplained cost = traffic bypassing the proxy or a price
+  change) and a ready-to-paste `model_pricing_yaml` block. Endpoints:
+  `POST /_proxy/calibrate/snapshot`, `GET /_proxy/calibrate/prices`,
+  `POST /_proxy/calibrate/reset`.
+
 ### `usage.py` — provider usage parsing (pure, no FastAPI)
 - `normalize_usage()`: maps the three provider usage wire formats to one
   canonical 4-field shape (input / output / cache_creation / cache_read).
@@ -234,6 +255,8 @@ testable on its own.
   lifetime totals, flushes to `stats.json` on an interval.
   - `record()`: called from `Metrics.request_finished`.
   - `summary()`: 24h / 7d / 30d / lifetime totals.
+  - `lifetime_tokens()`: cumulative per-model token counters by class
+    (model_pricing key names) — the proxy-side half of a calibration snapshot.
   - `series()`: bucketed time series for the dashboard graphs.
   - Cost is computed at read time from current pricing (re-pricing is
     retroactive); percentiles aren't kept long-term (only `duration_sum` → avg).
@@ -294,6 +317,9 @@ All endpoints read the `AppState` via `request.app.state.proxy`.
   **one-shot** scheduled LOW→HIGH / HIGH→LOW switch (the recurring **daily** ones
   are the `scheduled_high_at` / `scheduled_low_at` config keys; all four slots are
   independent). The two share `_set_oneshot_switch()`.
+- `POST /_proxy/calibrate/snapshot` (the provider's three cumulative cost
+  counters) / `GET /_proxy/calibrate/prices` / `POST /_proxy/calibrate/reset`
+  — per-model price calibration (see `calibrate.py`).
 - `POST /_proxy/window/count` — set one budget window's count (`{"count": N}`
   plus optional `"metric"` / `"window_seconds"` selectors; default: the
   requests window). `POST /_proxy/window/start` — set/clear start times
@@ -311,7 +337,10 @@ budget window** (from `limiter.window.windows`, `.stat.binding` highlights the
 most-utilized one) with per-lane spend + projections (`projected_human` from
 the limiter snapshot, `projected_auto` from `pacer.windows[i]`, index-aligned);
 a one-entry list is synthesized from the top-level mirror if a stale poll ever
-lacks `windows`.
+lacks `windows`. The header's **⚖ Calibrate** button opens a native `<dialog>`
+(price-calibration form → `POST /_proxy/calibrate/snapshot`, estimates table +
+paste-ready YAML from `GET /_proxy/calibrate/prices`, two-step reset button —
+no blocking `confirm()`).
 - **Layout**: the stat panels are wrapping **flexbox** rows (not CSS grid) —
   every `.stat` card is at least as wide as its content because `.sub` lines
   are `white-space: nowrap`; cards wrap as whole units. Keep sub-lines short
@@ -350,8 +379,8 @@ Tests: `python -m pytest` (unit tests for the pure modules; no server needed).
 - **Two lanes, one shared state.** The lanes differ *only* in admission policy
   (`request_lane` → `pacer.gate()` for auto, `acquire(lane)` priority). Don't add
   per-lane upstream clients or windows — humans + auto share one quota window.
-- **Keep the module graph acyclic**: `usage`/`metrics`/`limiter` are leaves;
-  `pacer` depends on `limiter` + `metrics`; `persistence` on `limiter` +
+- **Keep the module graph acyclic**: `usage`/`metrics`/`limiter`/`calibrate`
+  are leaves; `pacer` depends on `limiter` + `metrics`; `persistence` on `limiter` +
   `metrics`; `config` on all of those + `state`; `routes`/`server` at the top.
   No module reads globals — state is passed in (or read from
   `request.app.state.proxy` in routes).
@@ -363,10 +392,12 @@ Tests: `python -m pytest` (unit tests for the pure modules; no server needed).
   (`normalize_usage` is the single chokepoint — route new formats through it).
 - **The dashboard stays build-step-free** (vanilla JS, no bundler). Static files
   are served from a fixed allowlist in `routes.py`.
-- **Persistent state lives in two gitignored files**: `stats.json` (long-horizon
-  history) and `window.json` (current rolling-window count + start). Both are
-  written by `persist_loop` (~5s) and on shutdown; deleting them only loses that
-  state. `window.json` is discarded on load if its window has already elapsed.
+- **Persistent state lives in three gitignored files**: `stats.json`
+  (long-horizon history) and `window.json` (current rolling-window state) are
+  written by `persist_loop` (~5s) and on shutdown; `calibration.json`
+  (price-calibration snapshots) is written on each snapshot add. Deleting them
+  only loses that state. `window.json` entries are discarded on load if their
+  window has already elapsed.
 - **Entry-point compatibility:** `serve()` runs two `uvicorn.Server`s under one
   `startup`/`shutdown`; don't reintroduce per-server lifespan double-init. Don't
   break `uv run proxy.py` / `uvicorn proxy:app` (the shim) or the

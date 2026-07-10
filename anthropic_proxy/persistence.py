@@ -179,6 +179,23 @@ class PersistentStats:
 
     # -- read models --
 
+    def lifetime_tokens(self) -> dict[str, dict[str, float]]:
+        """Cumulative per-model token counters by class, for price calibration.
+
+        Monotone across restarts (lifetime totals are never pruned), which is
+        exactly what the calibrator's snapshot deltas need. Class names match
+        the model_pricing schema, not the usage wire fields.
+        """
+        return {
+            m: {
+                "input": float(c["input_tokens"]),
+                "cache_creation": float(c["cache_creation_input_tokens"]),
+                "cache_read": float(c["cache_read_input_tokens"]),
+                "output": float(c["output_tokens"]),
+            }
+            for m, c in self._lifetime.items()
+        }
+
     def _window_models(self, window_seconds: float | None) -> dict[str, dict[str, float]]:
         """Per-model counters aggregated over a trailing window (None=lifetime)."""
         if window_seconds is None:
