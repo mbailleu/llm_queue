@@ -26,16 +26,23 @@ class AutoPacer:
     evaluated and the **binding** (most constraining) one sets the pace. Per
     budget, in that budget's units:
 
-        usable_units = limit - used - safety * human_rate * units_per_req
+        usable_units = limit - used - safety * human_rate * human_units_per_req
                                               * min(remaining, lookahead)
                        - floor            (floor only for requests budgets)
-        usable_reqs  = usable_units / units_per_req
+        usable_reqs  = usable_units / auto_units_per_req
         rate         = usable_reqs / remaining   (requests/sec to even-spread)
 
     `units_per_req` converts between requests and the budget's units (1 for
     requests; a live EWMA of tokens/cost per request otherwise, with configured
-    assumed values before any data). The final rate is the minimum across
-    budgets, additionally capped by physical throughput
+    assumed values before any data). It is per-lane: predicted human demand is
+    sized with the human lane's EWMA, while the leftover is converted into auto
+    requests with the auto lane's — the two kinds of traffic can differ in size
+    by orders of magnitude. Windows shorter than
+    `human_reserve_min_window_seconds` skip the predicted-human term entirely:
+    they recover within seconds and the human lane is protected there by queue
+    priority + upstream 429 retries, so reserving on them only starves auto —
+    the reservation belongs to the long (e.g. 5h cost) budgets. The final rate
+    is the minimum across budgets, additionally capped by physical throughput
     (free slots / avg request time).
 
     As a window nears its end, `remaining -> 0`, the predicted-human term
@@ -73,6 +80,10 @@ class AutoPacer:
             float(cfg.get("human_demand_lookahead_seconds",
                           cfg.get("human_demand_horizon_seconds", 3600))),
         )
+        # Windows shorter than this carry no predicted-human reservation (see
+        # class docstring); 0 reserves on every window.
+        self._reserve_min_window = max(
+            0.0, float(cfg.get("human_reserve_min_window_seconds", 300)))
 
     def _evaluate(self) -> dict[str, Any]:
         """Evaluate every budget window and pick the binding (slowest) one.
@@ -95,7 +106,11 @@ class AutoPacer:
                 entries.append(None)  # dormant — the first request anchors it
                 continue
             metric = str(w.get("metric", "requests"))
-            units_per_req = self._limiter.units_per_request(metric)
+            # Convert the leftover into requests with the AUTO lane's own
+            # per-request estimate — that's what an auto request will actually
+            # consume; the blended EWMA is dominated by whichever lane runs
+            # more traffic (often big-context human requests).
+            units_per_req = self._limiter.units_per_request(metric, "auto")
             if units_per_req <= 0:
                 # Can't convert this budget into requests — e.g. a cost budget
                 # with no model_pricing configured (its count never rises
@@ -116,12 +131,22 @@ class AutoPacer:
                 continue
             limit = float(w["limit"])
             used = float(w["count"])
-            # Project the measured human rate forward only up to _lookahead, not
-            # across the whole (possibly multi-hour) remaining window — otherwise
-            # a small human rate reserves nearly the entire quota on a long
-            # window.
-            horizon = min(remaining, self._lookahead)
-            expected_human = self._safety * human_rate * units_per_req * horizon
+            window_seconds = float(w.get("window_seconds") or 0.0)
+            if window_seconds < self._reserve_min_window:
+                # Short windows self-heal within seconds and the human lane is
+                # protected there by queue priority + upstream 429 retries —
+                # reserving predicted demand on them only starves auto. The
+                # reservation lives on the long (e.g. 5h cost) budgets.
+                expected_human = 0.0
+            else:
+                # Project the measured human rate forward only up to
+                # _lookahead, not across the whole (possibly multi-hour)
+                # remaining window — otherwise a small human rate reserves
+                # nearly the entire quota on a long window. Sized with the
+                # HUMAN lane's per-request estimate.
+                horizon = min(remaining, self._lookahead)
+                expected_human = (self._safety * human_rate * horizon
+                                  * self._limiter.units_per_request(metric, "human"))
             # human_quota_floor is a request count; it applies only to requests
             # budgets rather than being converted into token/cost floors.
             floor_units = self._floor if metric == "requests" else 0.0
@@ -130,7 +155,7 @@ class AutoPacer:
             rate = usable_reqs / remaining if usable_reqs > 0 else 0.0
             entries.append({
                 "metric": metric,
-                "window_seconds": float(w.get("window_seconds") or 0.0),
+                "window_seconds": window_seconds,
                 "usable_units": usable_units,
                 "usable_reqs": usable_reqs,
                 "rate": rate,

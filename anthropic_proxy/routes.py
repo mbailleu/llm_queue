@@ -346,6 +346,11 @@ async def calibrate_prices_endpoint(req: Request):
     how much upstream cost the proxy's traffic explains (persistently
     unexplained cost = something is spending quota without going through the
     proxy, or a price changed — POST /_proxy/calibrate/reset then).
+
+    If the upstream never reported a cached-token count, `input` comes back
+    with `"blended": true` — one price covering cached + uncached input,
+    which is what this traffic can be billed with (the proxy can't see the
+    cached split either).
     """
     return _st(req).calibrator.solve()
 
@@ -357,8 +362,8 @@ async def calibrate_reset_endpoint(req: Request):
     return {"discarded": _st(req).calibrator.reset()}
 
 
-def _window_selectors(body: dict) -> tuple[str | None, float | None] | JSONResponse:
-    """Parse the optional metric / window_seconds window selectors from a body."""
+def _window_selectors(body: dict) -> tuple[str | None, float | None, str | None] | JSONResponse:
+    """Parse the optional metric / window_seconds / group window selectors."""
     metric = body.get("metric")
     if metric is not None:
         metric = str(metric).strip().lower()
@@ -374,7 +379,10 @@ def _window_selectors(body: dict) -> tuple[str | None, float | None] | JSONRespo
         except (TypeError, ValueError):
             return JSONResponse({"error": "'window_seconds' must be a number"},
                                 status_code=400)
-    return metric, window_seconds
+    group = body.get("group")
+    if group is not None:
+        group = str(group).strip() or None
+    return metric, window_seconds, group
 
 
 @router.post("/_proxy/window/count")
@@ -382,12 +390,15 @@ async def set_window_count_endpoint(req: Request):
     """Set one rolling quota window's current count.
 
     Body: {"count": <number >= 0>} plus optional selectors "metric"
-    ("requests" | "tokens" | "cost"; default "requests") and "window_seconds"
-    to pick which budget window when a tier tracks several. Anchors a fresh
-    window at now if the selected one isn't active. Examples:
+    ("requests" | "tokens" | "cost"; default "requests"), "window_seconds" and
+    "group" to pick which budget window when a tier tracks several. Anchors a
+    fresh window at now if the selected one isn't active (along with the rest
+    of its budget group, which shares its timer). Examples:
       curl -X POST localhost:8787/_proxy/window/count -d '{"count": 120}'
       curl -X POST localhost:8787/_proxy/window/count \\
            -d '{"count": 12.5, "metric": "cost", "window_seconds": 18000}'
+      curl -X POST localhost:8787/_proxy/window/count \\
+           -d '{"count": 5, "metric": "requests", "group": "minute"}'
     """
     st = _st(req)
     try:
@@ -405,10 +416,11 @@ async def set_window_count_endpoint(req: Request):
     sel = _window_selectors(body)
     if isinstance(sel, JSONResponse):
         return sel
-    snap = st.limiter.set_window_count(count, metric=sel[0], window_seconds=sel[1])
+    snap = st.limiter.set_window_count(count, metric=sel[0], window_seconds=sel[1],
+                                       group=sel[2])
     if snap is None:
         return JSONResponse(
-            {"error": "no quota window matches the given metric/window_seconds"},
+            {"error": "no quota window matches the given metric/window_seconds/group"},
             status_code=404,
         )
     await asyncio.to_thread(save_window_file, st.limiter, st.window_persist_path())
@@ -421,9 +433,12 @@ async def set_window_start_endpoint(req: Request):
 
     Body: {"started_at": <unix seconds>} to anchor, or {"started_at": null} to
     clear everything (the next request re-anchors fresh windows). Optional
-    selectors "metric" / "window_seconds" restrict which windows are anchored
-    (default: all of them). Example:
+    selectors "metric" / "window_seconds" / "group" restrict which windows are
+    anchored (default: all of them); a selected window's budget-group siblings
+    are always anchored with it, since a group is one timer. Example:
       curl -X POST localhost:8787/_proxy/window/start -d '{"started_at": 1733250000}'
+      curl -X POST localhost:8787/_proxy/window/start \\
+           -d '{"started_at": 1733250000, "group": "session"}'
     """
     st = _st(req)
     try:
@@ -444,10 +459,11 @@ async def set_window_start_endpoint(req: Request):
     sel = _window_selectors(body)
     if isinstance(sel, JSONResponse):
         return sel
-    snap = st.limiter.set_window_start(started_at, metric=sel[0], window_seconds=sel[1])
+    snap = st.limiter.set_window_start(started_at, metric=sel[0], window_seconds=sel[1],
+                                       group=sel[2])
     if snap is None:
         return JSONResponse(
-            {"error": "no quota window matches the given metric/window_seconds"},
+            {"error": "no quota window matches the given metric/window_seconds/group"},
             status_code=404,
         )
     await asyncio.to_thread(save_window_file, st.limiter, st.window_persist_path())

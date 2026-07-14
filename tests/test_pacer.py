@@ -70,6 +70,25 @@ def test_human_reservation_shrinks_usable():
     assert usable < no_humans_usable           # something is reserved
 
 
+def test_short_window_skips_human_reservation():
+    # Heavy measured human rate, but a 60s window is shorter than
+    # human_reserve_min_window_seconds — no predicted-human term, only what
+    # was actually used counts against auto.
+    lim, pacer = make_setup(window_seconds=60, window_limit=20, human_events=600,
+                            cfg_overrides={"human_reserve_min_window_seconds": 300})
+    lim.note_request("m", "human")
+    usable, _ = pacer._usable_and_rate()
+    assert 18.5 < usable <= 19.0
+
+
+def test_reserve_min_window_zero_keeps_reservation_on_short_windows():
+    lim, pacer = make_setup(window_seconds=60, window_limit=20, human_events=600,
+                            cfg_overrides={"human_reserve_min_window_seconds": 0})
+    lim.note_request("m", "human")
+    usable, _ = pacer._usable_and_rate()
+    assert usable < 18.5                   # reservation applies again
+
+
 def test_gate_disabled_returns_immediately():
     lim, pacer = make_setup(cfg_overrides={"auto_pacing_enabled": False})
 
@@ -167,6 +186,36 @@ def test_unpriced_cost_budget_never_binds():
     usable, rate = pacer._usable_and_rate()
     assert 8.5 < usable <= 9.0             # requests leftover, as legacy
     assert pacer.status()["binding_metric"] == "requests"
+
+
+def test_auto_conversion_uses_auto_lane_estimate():
+    lim, pacer = make_multi_setup([Budget("tokens", 1000, 100)],
+                                  cfg_overrides={"human_reserve_min_window_seconds": 0})
+    lim.note_request("m", "human")     # anchors the window
+    lim.note_usage(500, 0.0, "human")  # big interactive request
+    lim.note_usage(10, 0.0, "auto")    # small scripted request
+    usable, rate = pacer._usable_and_rate()
+    # leftover = 1000 - 510 = 490 tokens, converted at the AUTO lane's own
+    # estimate (10 tok/req) -> 49 requests; the blended EWMA (~108 tok/req)
+    # would have allowed only ~4.5.
+    assert 48 <= usable <= 50
+
+
+def test_human_reservation_sized_by_human_lane_estimate():
+    lim, pacer = make_multi_setup([Budget("tokens", 200000, 3600)],
+                                  cfg_overrides={"human_reserve_min_window_seconds": 300})
+    lim._started_at = time.monotonic() - 3600   # a full horizon of uptime
+    for _ in range(36):                # human_rate = 36/3600 = 0.01 req/s
+        lim._note_human()
+    lim.note_request("m", "human")
+    lim.note_usage(5000, 0.0, "human")   # human requests are 5000 tok each
+    lim.note_usage(10, 0.0, "auto")      # auto requests are tiny
+    usable, _ = pacer._usable_and_rate()
+    # reservation = 0.01 * 5000 * 3600 = 180000 tokens (human-sized), so
+    # usable_units ~ 200000 - 5010 - 180000 ~ 15000 -> ~1500 auto requests.
+    # Sizing it with the auto estimate (10 tok/req) would have reserved only
+    # 360 tokens and allowed ~19500.
+    assert 1300 <= usable <= 1600
 
 
 def test_status_exposes_per_window_projections():

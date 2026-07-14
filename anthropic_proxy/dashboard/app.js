@@ -240,8 +240,11 @@ async function tick() {
     const winCards = wins.map((w, i) => {
       const metric = w.metric || "requests";
       const noun = METRIC_NOUN[metric] ?? metric;
+      // Budgets sharing a `group` share one timer (same length, same start,
+      // they roll together), so name it on the card to explain the identical
+      // countdowns.
       const label = "Quota · " + fmtUnits(metric, w.limit) + (noun ? " " + noun : "")
-        + " / " + fmtWinLen(w.window_seconds);
+        + " / " + fmtWinLen(w.window_seconds) + (w.group ? " · " + w.group : "");
       const isBinding = wins.length > 1 && i === bindingIdx && w.active;
       if (!w.active) {
         return `
@@ -492,7 +495,8 @@ function renderCalibration(data) {
       if (e.price === null || e.price === undefined) {
         return `<td><span class="conf">unidentifiable</span></td>`;
       }
-      return `<td>$${e.price}<div class="conf ${e.confidence}">${e.confidence}</div></td>`;
+      const blend = e.blended ? " · blended" : "";  // cached+uncached in one price
+      return `<td>$${e.price}<div class="conf ${e.confidence}">${e.confidence}${blend}</div></td>`;
     };
     html += "<table><tr><th>Model</th><th>Input</th><th>Cache write</th><th>Cache read</th><th>Output</th></tr>";
     for (const m of models) {

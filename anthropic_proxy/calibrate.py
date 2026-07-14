@@ -21,6 +21,23 @@ cumulative, the "since the plan changed" baseline cancels in the deltas — the
 proxy's counters don't need to start at the same moment, only to be monotone
 across the span. An interval where any counter went backwards (plan reset,
 stats.json wiped) is skipped.
+
+**Blended-input fallback.** The cache_read split above only exists if the
+upstream reports a cached-token count (Anthropic always does; a bare
+OpenAI-compatible endpoint may not). When no interval has seen a single
+cache_read token, every cached prompt token is already lumped into `input`,
+so splitting the cost is not just unsolvable but actively wrong — dividing
+only the *uncached* cost by *all* input tokens underestimates the price. In
+that case the two input cost counters are summed and solved as ONE equation:
+
+    ΔCost_input_uncached + ΔCost_input_cached
+                       = Σ_m price_input[m]  · (ΔTok_input[m] + ΔTok_cache_read[m])
+                       + Σ_m price_cache_creation[m] · ΔTok_cache_creation[m]
+
+yielding a *blended* $/Mtok input price (marked `"blended": true`). That is
+the right number to bill this traffic with: the same blindness applies when
+`metrics.compute_cost` prices a request, since it too only ever sees the
+lumped `input` count.
 """
 from __future__ import annotations
 
@@ -36,13 +53,22 @@ log = logging.getLogger("proxy.calibrate")
 COST_KEYS = ("cost_input_uncached", "cost_input_cached", "cost_output")
 TOKEN_CLASSES = ("input", "cache_creation", "cache_read", "output")
 
-# Each system: (name, upstream cost key, [(token class, price key), ...]).
-# Price keys deliberately match the model_pricing config schema.
-_SYSTEMS = (
-    ("output", "cost_output", (("output", "output"),)),
-    ("input_cached", "cost_input_cached", (("cache_read", "cache_read"),)),
-    ("input_uncached", "cost_input_uncached",
+# Each system: (name, upstream cost keys (summed), [(token class, price key), ...]).
+# Price keys deliberately match the model_pricing config schema; two token
+# classes may map to the same price key, in which case their counts add up in
+# that unknown's coefficient.
+_OUTPUT_SYSTEM = ("output", ("cost_output",), (("output", "output"),))
+_SPLIT_INPUT_SYSTEMS = (
+    ("input_cached", ("cost_input_cached",), (("cache_read", "cache_read"),)),
+    ("input_uncached", ("cost_input_uncached",),
      (("input", "input"), ("cache_creation", "cache_creation"))),
+)
+# Used instead when the upstream never reported a cached-token count: both
+# input cost counters against one blended input price (see module docstring).
+_MERGED_INPUT_SYSTEM = (
+    "input_blended", ("cost_input_uncached", "cost_input_cached"),
+    (("input", "input"), ("cache_read", "input"),
+     ("cache_creation", "cache_creation")),
 )
 
 
@@ -231,7 +257,18 @@ class Calibrator:
             notes.append(f"{skipped} interval(s) skipped: a counter went "
                          f"backwards (plan/stats reset)")
 
-        for name, cost_key, parts in _SYSTEMS:
+        blended = not any(d.get("cache_read", 0) > 0
+                          for iv in intervals for d in iv["tokens"].values())
+        systems = [_OUTPUT_SYSTEM]
+        systems += [_MERGED_INPUT_SYSTEM] if blended else list(_SPLIT_INPUT_SYSTEMS)
+        if blended and any(iv["costs"]["cost_input_cached"] > 0 for iv in intervals):
+            notes.append("upstream reports no cached-token counts: cached + "
+                         "uncached input cost solved as one blended input price")
+
+        for name, cost_keys, parts in systems:
+            classes_of: dict[str, list[str]] = {}
+            for cls, pkey in parts:
+                classes_of.setdefault(pkey, []).append(cls)
             # Unknowns: one per (model, price_key) with any tokens observed.
             unknowns: list[tuple[str, str]] = []
             for iv in intervals:
@@ -247,17 +284,21 @@ class Calibrator:
             for iv in intervals:
                 coeffs = []
                 for m, pkey in unknowns:
-                    cls = next(c for c, pk in parts if pk == pkey)
-                    coeffs.append(iv["tokens"].get(m, {}).get(cls, 0.0) / 1e6)
+                    d = iv["tokens"].get(m, {})
+                    coeffs.append(sum(d.get(c, 0.0)
+                                      for c in classes_of[pkey]) / 1e6)
                 if not any(coeffs):
                     continue
-                rows.append((coeffs, iv["costs"][cost_key]))
+                y = sum(iv["costs"][k] for k in cost_keys)
+                rows.append((coeffs, y))
                 nz = [i for i, c in enumerate(coeffs) if c > 0]
-                if len(nz) == 1 and iv["costs"][cost_key] > 0:
+                if len(nz) == 1 and y > 0:
                     direct.add(unknowns[nz[0]])
             solution = _lstsq(rows, len(unknowns))
             for (m, pkey), val in zip(unknowns, solution):
                 entry: dict[str, Any] = {"price": None, "confidence": "unidentifiable"}
+                if name == "input_blended" and pkey == "input":
+                    entry["blended"] = True  # covers cached + uncached input
                 if val is not None:
                     if val < 0:
                         notes.append(f"{m}.{pkey}: negative estimate "
@@ -277,7 +318,7 @@ class Calibrator:
                 actual += y
                 explained += sum(c * (solution[i] or 0.0)
                                  for i, c in enumerate(coeffs))
-            residuals[cost_key] = {
+            residuals["+".join(cost_keys)] = {
                 "intervals": usable,
                 "actual": round(actual, 4),
                 "explained": round(explained, 4),
@@ -298,12 +339,14 @@ class Calibrator:
         """Ready-to-paste model_pricing block (identified prices only)."""
         lines = ["model_pricing:"]
         for m in sorted(prices):
-            known = {k: v["price"] for k, v in prices[m].items()
-                     if v["price"] is not None}
+            known = {k: v for k, v in prices[m].items() if v["price"] is not None}
             if not known:
                 continue
             lines.append(f"  {m}:")
             for key in ("input", "output", "cache_creation", "cache_read"):
-                if key in known:
-                    lines.append(f"    {key}: {known[key]}")
+                if key not in known:
+                    continue
+                note = "  # blended: cached + uncached input" \
+                    if known[key].get("blended") else ""
+                lines.append(f"    {key}: {known[key]['price']}{note}")
         return "\n".join(lines) if len(lines) > 1 else ""

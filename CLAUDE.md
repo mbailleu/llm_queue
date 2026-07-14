@@ -58,10 +58,14 @@ testable on its own.
 - `DEFAULT_CONFIG`: every config key with its default and an inline explanation.
   Source of truth for what's configurable.
 - `load_config_file()` (YAML merged over defaults), `make_tier()` +
-  `parse_budgets()` (a tier's `limits` list → validated `Budget`s; without one
-  the legacy per-tier `window_seconds`/`window_limit` — falling back to the
-  top-level `rate_window_*` — become a single requests budget, so old
-  request-based configs keep working; `limits` wins if both are present),
+  `parse_budgets()` (a tier's `limits` list → validated `Budget`s, incl. each
+  entry's optional `group`; since a group is one shared window, a member whose
+  `window_seconds` disagrees with the group's first-seen length is logged and
+  **kept ungrouped** — its quota still needs tracking, just on its own timer.
+  Without a `limits` list the legacy per-tier `window_seconds`/`window_limit` —
+  falling back to the top-level `rate_window_*` — become a single requests
+  budget, so old request-based configs keep working; `limits` wins if both are
+  present),
   `parse_window_weights()`, `parse_switch_time()` (unix seconds / `HH:MM` /
   ISO-8601 → absolute timestamp).
 - `build_state()`: the bootstrap — builds the limiter/metrics/pstats/pacer,
@@ -77,8 +81,23 @@ testable on its own.
 
 ### `limiter.py` — tiers, queue, lanes, quota windows
 - `Budget`: one quota dimension — `limit` units of `metric` (`"requests"` |
-  `"tokens"` | `"cost"`) per `window_seconds`. `BudgetWindow`: the live rolling
-  state for one Budget (start / count / human / auto lane split).
+  `"tokens"` | `"cost"`) per `window_seconds`, plus an optional **`group`** name.
+  `BudgetWindow`: the live rolling state for one Budget (start / count / human /
+  auto lane split) plus `siblings` — the list of windows sharing its timer.
+- **Budget groups.** Budgets that name the same `group` share **one timer**: they
+  anchor together and roll together. Without a group each window anchors on
+  whatever event first touches it (`note_request` for requests, `note_usage` for
+  tokens/cost) and re-anchors independently on every roll, so equal-length
+  budgets **drift apart** — the group is what keeps "20 req/min + 500k tok/min +
+  $50/min" on one shared minute. A group **is** one window, so every member must
+  declare the same `window_seconds` (`parse_budgets` enforces this); grouping is
+  **opt-in** — an ungrouped budget keeps its own timer exactly as before.
+  `_link_groups()` builds the shared `siblings` list, `_anchor_group()` restarts
+  all members at once, `_roll_if_elapsed()` rolls a window *and its group*, and
+  `_sync_group_starts()` re-establishes one start per group after a config reload
+  or a `window.json` restore (a member that joined a running group adopts the
+  group's clock rather than sitting dormant). **Invariant: all siblings always
+  hold the same `start`.**
 - `Tier`: name + `max_concurrent` + its **own list of rolling quota budgets**
   (`budgets`). The new plan defaults: LOW = 20 req/min + 500k tok/min + $50/min
   + $30/5h at 4 concurrent; HIGH = 1000 req/min + 500k tok/min + $50/min +
@@ -120,9 +139,11 @@ testable on its own.
     boost, or a forced config switch) — rebuilds `_windows` (one `BudgetWindow`
     per active-tier Budget) so every counter + timer re-anchors under the new
     tier's budgets. `_reconcile_windows()` is the same-tier variant used by
-    `update_tiers` on config reload: windows whose (metric, window_seconds)
-    survive keep their count/start and pick up a changed limit; added/removed
-    budgets are created/dropped.
+    `update_tiers` on config reload: windows whose (metric, window_seconds,
+    **group**) survive keep their count/start and pick up a changed limit;
+    added/removed budgets are created/dropped, and moving a budget to a
+    different group restarts its window. Both end by re-linking groups so the
+    shared-start invariant holds.
   - `note_request()` / `note_usage()` / `note_done()` / `discount_request()` /
     `_window_snapshot()` / `window_snapshot()`: track the rolling quota
     **windows** for the *active* tier (dashboard quota cards — tracked, NOT
@@ -133,12 +154,12 @@ testable on its own.
     at completion via `note_usage(tokens, cost, lane)` — success only, all four
     usage fields summed, cost priced by the caller (unpriced models add $0).
     `note_request` anchors every window (dormant/elapsed ones re-anchor
-    independently — a 60s window rolls many times inside a 5h one); fresh
-    requests windows carry the in-flight tally forward, token/cost windows
-    start empty. Each window keeps a human/auto split (invariant: they sum to
+    independently — a 60s window rolls many times inside a 5h one — **except
+    within a group, which anchors and rolls as a unit**); fresh requests windows
+    carry the in-flight tally forward, token/cost windows start empty. Each window keeps a human/auto split (invariant: they sum to
     its count). The snapshot exposes a `windows` list (per window: metric,
-    limit, count, lane split, `utilization`, countdowns, `projected_human` =
-    `human + human_rate·units_per_request(metric)·effective_remaining`) plus a
+    limit, group, count, lane split, `utilization`, countdowns, `projected_human` =
+    `human + human_rate·units_per_request(metric, "human")·effective_remaining`) plus a
     `binding` index (highest utilization) whose fields are **mirrored at the
     top level** for the statusline/legacy consumers. A pending LOW→HIGH switch
     ends every window early via `effective_remaining_seconds` + `switch_at`
@@ -150,22 +171,32 @@ testable on its own.
     accumulator that fresh requests windows are re-seeded from. Splits are
     persisted in `window.json` and restored on boot (human re-derived as
     `count - auto`); the in-flight tally is ephemeral.
-  - `note_usage` also feeds per-request **token/cost EWMAs**;
-    `units_per_request(metric)` reports them (1.0 for requests; the
-    `auto_assumed_tokens_per_request` / `auto_assumed_cost_per_request` config
-    fallbacks via `set_assumed_units()` before any data). This is how the
-    pacer/projections convert between requests and token/$ units without the
-    limiter importing metrics.
+  - `note_usage` also feeds per-request **token/cost EWMAs** — one blended
+    pair plus a pair **per lane** (interactive and automation requests can
+    differ in size by orders of magnitude); `units_per_request(metric,
+    lane=None)` reports them (1.0 for requests; a lane's own EWMA falls back
+    to the blended one, then to the `auto_assumed_tokens_per_request` /
+    `auto_assumed_cost_per_request` config fallbacks via `set_assumed_units()`
+    before any data). This is how the pacer/projections convert between
+    requests and token/$ units without the limiter importing metrics — the
+    pacer sizes predicted human demand with the human estimate and converts
+    leftovers into auto requests with the auto estimate.
   - `_note_human()` / `human_rate()`: track human arrivals (a `deque` over
     `human_demand_horizon`) and report a horizon-averaged rate for the pacer.
   - `set_window_count()` / `set_window_start()`: manual overrides behind the
-    `/_proxy/window/*` endpoints; optional `metric` / `window_seconds`
-    selectors pick the budget window (count defaults to the requests window,
-    start to all windows; both return None when nothing matches).
+    `/_proxy/window/*` endpoints; optional `metric` / `window_seconds` / `group`
+    selectors pick the budget window(s) (count defaults to the requests window,
+    start to all windows; both return None when nothing matches). Group-aware:
+    setting a start applies it to each match **and its siblings**, and touching a
+    stale window anchors its whole group — you can't move one member off its
+    group's clock.
   - `window_state()` / `load_window_state()`: serialize / restore the windows
     for `window.json` persistence (v2: one entry per anchored window, matched
-    back by metric + window_seconds; elapsed/unmatched entries are dropped; a
-    legacy single-window file restores into the first requests budget).
+    back by metric + window_seconds + group; elapsed/unmatched entries are
+    dropped; an entry with no `group` key — written before groups existed —
+    matches any group, and a legacy single-window file restores into the first
+    requests budget). A restore ends with `_sync_group_starts()`, so a budget
+    added to a group while the proxy was down adopts its group's clock.
   - `enter_rl_wait()` / `leave_rl_wait()`: bump a **rate-limit retry-backoff
     gauge** (`_rl_waiting` + per-lane), bracketed by the proxy handler around the
     429/503/529 backoff sleep. A request waiting out upstream pushback holds no
@@ -186,11 +217,19 @@ testable on its own.
   `gate()` blocks an auto request until it may proceed. `_evaluate()` scores
   **every budget window** and the **binding** (slowest) one sets the pace: per
   budget, in its own units, `usable_units = limit − used −
-  safety·human_rate·units_per_request·min(time_left, lookahead) − floor`
+  safety·human_rate·units_per_request(human)·min(time_left, lookahead) − floor`
   (floor for requests budgets only), converted back to requests via
-  `units_per_request(metric)` and to a rate `usable_reqs/time_left`; the final
-  rate is the min across budgets, capped by `max_concurrent/avg_request_time`.
-  Inactive windows, windows about to roll, and unconvertible ones
+  `units_per_request(metric, "auto")` and to a rate `usable_reqs/time_left`;
+  the final rate is the min across budgets, capped by
+  `max_concurrent/avg_request_time`. The two per-lane estimates matter:
+  predicted human demand is sized from what human requests actually consume,
+  while the leftover is turned into auto requests at auto's own (often much
+  smaller) per-request size. Windows **shorter than
+  `human_reserve_min_window_seconds`** (default 300) skip the predicted-human
+  term entirely — a per-minute window recovers in ≤60s and humans are
+  protected there by queue priority + upstream 429 retries, so the
+  reservation lives on the long (e.g. 5h cost) budgets. Inactive windows,
+  windows about to roll, and unconvertible ones
   (`units_per_request ≤ 0`, e.g. cost with no pricing — which can't fill
   either) can never bind. `_usable_and_rate()` stays the 2-tuple wrapper. The
   `min(…, lookahead)` (`human_demand_lookahead_seconds`) stops a long (e.g. 5h)
@@ -225,7 +264,13 @@ testable on its own.
   `regression` (joint solve), or `unidentifiable` (rank-deficient — e.g. two
   models always in the same ratio). Cumulative counters mean the baselines
   cancel in deltas; an interval where any counter went backwards
-  (plan/stats reset) is skipped. `solve()` also reports per-counter
+  (plan/stats reset) is skipped. **If no interval saw a single cache_read
+  token** (upstream doesn't report cached-token counts, so the proxy lumps
+  cached prompt tokens into `input`), the two input cost counters are summed
+  and solved as **one blended input price** (`"blended": true` on the entry, a
+  note, and a `# blended` comment in the YAML) instead of underestimating
+  `input` by dividing only the uncached cost by all input tokens. Residuals are
+  keyed by the cost counters a system consumed, joined with `+`. `solve()` also reports per-counter
   residuals (unexplained cost = traffic bypassing the proxy or a price
   change) and a ready-to-paste `model_pricing_yaml` block. Endpoints:
   `POST /_proxy/calibrate/snapshot`, `GET /_proxy/calibrate/prices`,
@@ -321,12 +366,14 @@ All endpoints read the `AppState` via `request.app.state.proxy`.
   counters) / `GET /_proxy/calibrate/prices` / `POST /_proxy/calibrate/reset`
   — per-model price calibration (see `calibrate.py`).
 - `POST /_proxy/window/count` — set one budget window's count (`{"count": N}`
-  plus optional `"metric"` / `"window_seconds"` selectors; default: the
-  requests window). `POST /_proxy/window/start` — set/clear start times
+  plus optional `"metric"` / `"window_seconds"` / `"group"` selectors; default:
+  the requests window). `POST /_proxy/window/start` — set/clear start times
   (`{"started_at": <unix seconds>|null}`, optional selectors; default: all
   windows, null = full restart). Both 404 when nothing matches and persist to
-  `window.json` immediately. Example:
+  `window.json` immediately. A `"group"` selector addresses a whole shared timer;
+  a start always moves every sibling with it. Examples:
   `curl -X POST localhost:8787/_proxy/window/count -d '{"count": 12.5, "metric": "cost", "window_seconds": 18000}'`
+  `curl -X POST localhost:8787/_proxy/window/start -d '{"started_at": null, "group": "minute"}'`
 
 ### `dashboard/` — index.html, styles.css, app.js
 Self-contained vanilla HTML/CSS/JS, no build step. `app.js` polls
@@ -334,7 +381,9 @@ Self-contained vanilla HTML/CSS/JS, no build step. `app.js` polls
 files are read per request, so dashboard edits show up on browser reload
 without restarting the proxy. The state grid renders **one quota card per
 budget window** (from `limiter.window.windows`, `.stat.binding` highlights the
-most-utilized one) with per-lane spend + projections (`projected_human` from
+most-utilized one; a window's `group` is appended to its card label, so members
+of one shared timer are visibly a set) with per-lane spend + projections
+(`projected_human` from
 the limiter snapshot, `projected_auto` from `pacer.windows[i]`, index-aligned);
 a one-entry list is synthesized from the top-level mirror if a stale poll ever
 lacks `windows`. The header's **⚖ Calibrate** button opens a native `<dialog>`

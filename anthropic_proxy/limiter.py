@@ -35,6 +35,9 @@ def next_time_of_day(tod_seconds: float, now: float) -> float:
 
 BUDGET_METRICS = ("requests", "tokens", "cost")
 _METRIC_UNIT = {"requests": "req", "tokens": "tok", "cost": "$"}
+# "the entry didn't say" — distinct from an explicit `"group": null` (ungrouped),
+# so a window.json written before budget groups existed still restores.
+_ANY_GROUP = object()
 
 
 class Budget:
@@ -43,19 +46,28 @@ class Budget:
     metric is "requests" (weighted request count), "tokens" (all four usage
     token fields summed), or "cost" (priced USD, so cost budgets only count
     models with `model_pricing` entries).
-    """
-    __slots__ = ("metric", "limit", "window_seconds")
 
-    def __init__(self, metric: str, limit: float, window_seconds: float):
+    `group` optionally ties this budget to others on ONE shared timer: budgets
+    in the same group anchor at the same instant and roll together (upstream
+    per-minute request/token/cost limits are usually one clock, not three).
+    All budgets of a group must therefore declare the same `window_seconds`.
+    `group=None` (the default) keeps the budget on its own independent timer.
+    """
+    __slots__ = ("metric", "limit", "window_seconds", "group")
+
+    def __init__(self, metric: str, limit: float, window_seconds: float,
+                 group: str | None = None):
         if metric not in BUDGET_METRICS:
             raise ValueError(f"unknown budget metric {metric!r}")
         self.metric = metric
         self.limit = float(limit)
         self.window_seconds = float(window_seconds)
+        self.group = group or None
 
     def __str__(self) -> str:
         lim = int(self.limit) if self.limit.is_integer() else self.limit
-        return f"{lim}{_METRIC_UNIT[self.metric]}/{self.window_seconds:.0f}s"
+        s = f"{lim}{_METRIC_UNIT[self.metric]}/{self.window_seconds:.0f}s"
+        return f"{s}@{self.group}" if self.group else s
 
 
 class BudgetWindow:
@@ -63,8 +75,13 @@ class BudgetWindow:
 
     `start` is None while dormant (nothing has anchored it yet, or the state
     was reset); `human + auto == count` is the lane-split invariant.
+
+    `siblings` is the window's budget group: every window sharing one timer,
+    including this one (just `[self]` for an ungrouped budget). Anchoring or
+    rolling any member moves the whole group, so all siblings always hold the
+    same `start` — that is the group invariant every mutation path preserves.
     """
-    __slots__ = ("budget", "start", "count", "human", "auto")
+    __slots__ = ("budget", "start", "count", "human", "auto", "siblings")
 
     def __init__(self, budget: Budget):
         self.budget = budget
@@ -72,6 +89,7 @@ class BudgetWindow:
         self.count = 0.0
         self.human = 0.0
         self.auto = 0.0
+        self.siblings: list["BudgetWindow"] = [self]
 
 
 class Tier:
@@ -183,7 +201,10 @@ class Limiter:
         # not enforced for humans (upstream 429s + retry do that). All windows
         # restart on every tier change (see _restart_window). Each window keeps
         # a human/auto lane split with the invariant human + auto == count.
+        # Budgets sharing a `group` share one timer (see _link_groups); ungrouped
+        # ones each keep their own.
         self._windows: list[BudgetWindow] = [BudgetWindow(b) for b in self._active.budgets]
+        self._link_groups()
         # Weight of requests that have been noted against the window but not yet
         # finalized ("in flight" for accounting). Used to re-seed the count when
         # the window restarts mid-flight (e.g. a probe-driven tier switch), so
@@ -203,8 +224,14 @@ class Limiter:
         # human *request* rate into token/$ rates for projections and pacing
         # without the limiter depending on the metrics module. None until the
         # first completion; the assumed_* config fallbacks apply until then.
+        # Blended (both lanes) plus per-lane: interactive and automation
+        # requests can differ in size by orders of magnitude, so the pacer
+        # reserves human demand with the human estimate and converts the
+        # leftover into auto requests with the auto estimate.
         self._ewma_tokens_per_req: float | None = None
         self._ewma_cost_per_req: float | None = None
+        self._ewma_tokens_by_lane: dict[str, float | None] = {"human": None, "auto": None}
+        self._ewma_cost_by_lane: dict[str, float | None] = {"human": None, "auto": None}
         self._assumed_tokens_per_req = 20000.0
         self._assumed_cost_per_req = 0.05
         self._n_requests = 0
@@ -239,39 +266,88 @@ class Limiter:
                 return float(w)
         return self._default_window_weight
 
-    def _seed_requests_window(self, w: BudgetWindow, now: float) -> None:
-        """Anchor a fresh requests window carrying the in-flight tally forward.
+    def _link_groups(self) -> None:
+        """Wire each window's `siblings` list from its budget's group name.
+
+        Budgets sharing a group share ONE timer, so they must anchor and roll
+        as a unit; an ungrouped budget is its own singleton group. Called
+        whenever `self._windows` is rebuilt.
+        """
+        groups: dict[str, list[BudgetWindow]] = {}
+        for w in self._windows:
+            if w.budget.group is None:
+                w.siblings = [w]
+            else:
+                groups.setdefault(w.budget.group, []).append(w)
+        for members in groups.values():
+            for w in members:
+                w.siblings = members
+
+    def _groups(self) -> list[list[BudgetWindow]]:
+        """The distinct budget groups (each a list of windows sharing a timer)."""
+        out: list[list[BudgetWindow]] = []
+        seen: set[int] = set()
+        for w in self._windows:
+            if id(w.siblings) not in seen:
+                seen.add(id(w.siblings))
+                out.append(w.siblings)
+        return out
+
+    def _anchor_group(self, members: list[BudgetWindow], now: float) -> None:
+        """Start a fresh window for every member of one group, at `now`.
 
         Requests still in flight keep consuming quota under whatever window is
-        current, so a restart/roll must not erase them from the indicator. Only
+        current, so a restart/roll must not erase them from the indicator:
+        fresh requests windows carry the in-flight tally forward. Only
         requests-metric windows have a known in-flight weight; token/cost usage
         is unknown until completion and simply lands in whichever window is
-        current then.
+        current then, so those start empty.
         """
-        if self._inflight_weight > 0:
-            w.start = now
-            w.count = self._inflight_weight
-            w.human = self._inflight_weight_human
-            w.auto = self._inflight_weight_auto
-        else:
-            w.start = None
-            w.count = w.human = w.auto = 0.0
+        for m in members:
+            m.start = now
+            if m.budget.metric == "requests":
+                m.count = self._inflight_weight
+                m.human = self._inflight_weight_human
+                m.auto = self._inflight_weight_auto
+            else:
+                m.count = m.human = m.auto = 0.0
 
     def _roll_if_elapsed(self, w: BudgetWindow, now: float) -> None:
         """Re-anchor `w` at `now` if it is dormant or its window has elapsed.
 
-        Fresh requests windows carry the in-flight weight forward (those
-        requests spill into the new window and keep consuming its quota);
-        token/cost windows start from zero.
+        Rolls `w`'s whole budget group: group members share one timer, so the
+        one that noticed the elapse restarts all of them (they hold the same
+        `start` and `window_seconds`, so they always elapse together anyway —
+        but a token window may be the first to be *touched* after the roll).
         """
         if w.start is None or now - w.start >= w.budget.window_seconds:
-            w.start = now
-            if w.budget.metric == "requests":
-                w.count = self._inflight_weight
-                w.human = self._inflight_weight_human
-                w.auto = self._inflight_weight_auto
-            else:
-                w.count = w.human = w.auto = 0.0
+            self._anchor_group(w.siblings, now)
+
+    def _sync_group_starts(self) -> None:
+        """Re-establish the group invariant: one shared `start` per group.
+
+        A budget that joins an already-running group (a config reload adding a
+        limit, or a `window.json` written before the group existed) would
+        otherwise sit dormant while its siblings run — it adopts the group's
+        timer instead, with empty counts (a requests budget seeded from the
+        in-flight tally, as on any fresh anchor). If persisted members disagree
+        on the start (a hand-edited window.json), the earliest wins so the
+        group rolls no later than the most conservative entry.
+        """
+        for members in self._groups():
+            starts = [w.start for w in members if w.start is not None]
+            if not starts:
+                continue
+            start = min(starts)
+            for w in members:
+                if w.start is None:
+                    if w.budget.metric == "requests":
+                        w.count = self._inflight_weight
+                        w.human = self._inflight_weight_human
+                        w.auto = self._inflight_weight_auto
+                    else:
+                        w.count = w.human = w.auto = 0.0
+                w.start = start
 
     def _restart_window(self) -> None:
         """Restart every rolling quota window for the (new) active tier.
@@ -288,9 +364,15 @@ class Limiter:
         """
         now = time.time()
         self._windows = [BudgetWindow(b) for b in self._active.budgets]
-        for w in self._windows:
-            if w.budget.metric == "requests":
-                self._seed_requests_window(w, now)
+        self._link_groups()
+        # Only a group holding a requests budget can be seeded from the
+        # in-flight tally — and then the whole group's timer starts now, since
+        # its members share one clock. With nothing in flight every group stays
+        # dormant for the next request to anchor.
+        if self._inflight_weight > 0:
+            for members in self._groups():
+                if any(m.budget.metric == "requests" for m in members):
+                    self._anchor_group(members, now)
         # Every path that lands on HIGH means a fresh (large) quota window —
         # requests parked in a 429 backoff are waiting on a limit that just
         # reset, so release them to retry now. Callers set self._active before
@@ -304,28 +386,37 @@ class Limiter:
     def _reconcile_windows(self) -> None:
         """Adopt a changed budget list for the SAME active tier (config reload).
 
-        Windows whose (metric, window_seconds) still exist keep their count and
-        start (only the limit is picked up live); budgets that disappeared are
-        dropped; new requests budgets are seeded from the in-flight tally like
-        a restart, other new budgets start dormant. Synchronous and await-free;
-        callers hold `self._cond`.
+        Windows whose (group, metric, window_seconds) still exist keep their
+        count and start (only the limit is picked up live); budgets that
+        disappeared are dropped; new requests budgets are seeded from the
+        in-flight tally like a restart, other new budgets start dormant — but a
+        new budget joining a *running* group adopts that group's timer
+        (`_sync_group_starts`), since a group is one clock. Regrouping a budget
+        (a changed `group` name) restarts its window: it now belongs to a
+        different timer. Synchronous and await-free; callers hold `self._cond`.
         """
         old = list(self._windows)
         now = time.time()
         fresh: list[BudgetWindow] = []
         for b in self._active.budgets:
             match = next((w for w in old if w.budget.metric == b.metric
-                          and w.budget.window_seconds == b.window_seconds), None)
+                          and w.budget.window_seconds == b.window_seconds
+                          and w.budget.group == b.group), None)
             if match is not None:
                 old.remove(match)
                 match.budget = b  # pick up a changed limit live
                 fresh.append(match)
             else:
                 w = BudgetWindow(b)
-                if b.metric == "requests":
-                    self._seed_requests_window(w, now)
+                if b.metric == "requests" and self._inflight_weight > 0:
+                    w.start = now
+                    w.count = self._inflight_weight
+                    w.human = self._inflight_weight_human
+                    w.auto = self._inflight_weight_auto
                 fresh.append(w)
         self._windows = fresh
+        self._link_groups()
+        self._sync_group_starts()
 
     def note_request(self, model: str = "", lane: str = "human") -> tuple[float, Any]:
         """Count one client request against the rolling quota windows.
@@ -431,6 +522,11 @@ class Limiter:
             else 0.2 * tokens + 0.8 * self._ewma_tokens_per_req
         self._ewma_cost_per_req = cost if self._ewma_cost_per_req is None \
             else 0.2 * cost + 0.8 * self._ewma_cost_per_req
+        key = "auto" if lane == "auto" else "human"
+        t = self._ewma_tokens_by_lane[key]
+        self._ewma_tokens_by_lane[key] = tokens if t is None else 0.2 * tokens + 0.8 * t
+        c = self._ewma_cost_by_lane[key]
+        self._ewma_cost_by_lane[key] = cost if c is None else 0.2 * cost + 0.8 * c
         now = time.time()
         for w in self._windows:
             units = tokens if w.budget.metric == "tokens" \
@@ -444,20 +540,26 @@ class Limiter:
             else:
                 w.human += units
 
-    def units_per_request(self, metric: str) -> float:
+    def units_per_request(self, metric: str, lane: str | None = None) -> float:
         """Estimated units of `metric` one request consumes (1.0 for requests).
 
         The token/cost estimates come from the note_usage EWMAs, falling back
         to the configured assumed values before any completion has been
         measured. Used to convert the human request rate into per-metric rates
         for projections and by the pacer to convert budget leftovers back into
-        request rates.
+        request rates. With a `lane` ("human"/"auto") the estimate is that
+        lane's own EWMA, falling back to the blended one — interactive and
+        automation requests can differ in size by orders of magnitude, so
+        per-lane callers get per-lane numbers as soon as that lane has
+        completed anything.
         """
         if metric == "tokens":
-            v = self._ewma_tokens_per_req
+            per_lane = self._ewma_tokens_by_lane.get(lane) if lane else None
+            v = per_lane if per_lane is not None else self._ewma_tokens_per_req
             return v if v is not None else self._assumed_tokens_per_req
         if metric == "cost":
-            v = self._ewma_cost_per_req
+            per_lane = self._ewma_cost_by_lane.get(lane) if lane else None
+            v = per_lane if per_lane is not None else self._ewma_cost_per_req
             return v if v is not None else self._assumed_cost_per_req
         return 1.0
 
@@ -494,6 +596,7 @@ class Limiter:
                 windows.append({
                     "active": False,
                     "metric": b.metric,
+                    "group": b.group,
                     "limit": _n(b.limit, nd),
                     "window_seconds": b.window_seconds,
                     "count": 0, "count_human": 0, "count_auto": 0,
@@ -517,7 +620,7 @@ class Limiter:
             # this is a display estimate, not the pacer's reservation. The
             # background (auto) projection is added by AutoPacer.status() since
             # it owns the leftover-budget calculation.
-            projected_human = w.human + human_rate * self.units_per_request(b.metric) * effective_remaining
+            projected_human = w.human + human_rate * self.units_per_request(b.metric, "human") * effective_remaining
             utilization = w.count / b.limit if b.limit > 0 else 0.0
             if utilization > binding_util:
                 binding_util = utilization
@@ -525,6 +628,7 @@ class Limiter:
             windows.append({
                 "active": True,
                 "metric": b.metric,
+                "group": b.group,
                 "limit": _n(b.limit, nd),
                 "window_seconds": b.window_seconds,
                 "count": _n(w.count, nd),
@@ -540,7 +644,7 @@ class Limiter:
             })
         if not windows:  # defensive: a Tier always has at least one budget
             windows = [{
-                "active": False, "metric": "requests", "limit": 0,
+                "active": False, "metric": "requests", "group": None, "limit": 0,
                 "window_seconds": 0.0, "count": 0, "count_human": 0,
                 "count_auto": 0, "utilization": 0.0, "projected_human": 0,
                 "started_at": None, "elapsed_seconds": None,
@@ -561,36 +665,38 @@ class Limiter:
     # -- manual window overrides + persistence (sync, await-free: atomic under
     #    the single-threaded loop, like note_request) --
 
-    def _select_windows(self, metric: str | None,
-                        window_seconds: float | None) -> list[BudgetWindow]:
-        """Windows matching the optional (metric, window_seconds) selectors."""
+    def _select_windows(self, metric: str | None, window_seconds: float | None,
+                        group: str | None = None) -> list[BudgetWindow]:
+        """Windows matching the optional (metric, window_seconds, group) selectors."""
         out = []
         for w in self._windows:
             if metric is not None and w.budget.metric != metric:
                 continue
             if window_seconds is not None and w.budget.window_seconds != float(window_seconds):
                 continue
+            if group is not None and w.budget.group != group:
+                continue
             out.append(w)
         return out
 
     def set_window_count(self, count: float, metric: str | None = None,
-                         window_seconds: float | None = None) -> dict[str, Any] | None:
+                         window_seconds: float | None = None,
+                         group: str | None = None) -> dict[str, Any] | None:
         """Force one rolling window's current count.
 
-        Selectors pick the window: `metric` defaults to "requests" and
-        `window_seconds` to the first match, so legacy calls without selectors
-        keep targeting the request window. If the selected window is not
-        currently active (never started, or elapsed) a fresh one is anchored at
-        now so the count is visible. Returns the new window snapshot, or None
-        when no window matches the selectors.
+        Selectors pick the window: `metric` defaults to "requests", and
+        `window_seconds` / `group` narrow further, so legacy calls without
+        selectors keep targeting the request window. If the selected window is
+        not currently active (never started, or elapsed) a fresh one is
+        anchored at now — along with the rest of its budget group, which shares
+        its timer. Returns the new window snapshot, or None when no window
+        matches the selectors.
         """
-        matches = self._select_windows(metric or "requests", window_seconds)
+        matches = self._select_windows(metric or "requests", window_seconds, group)
         if not matches:
             return None
         w = matches[0]
-        now = time.time()
-        if w.start is None or now - w.start >= w.budget.window_seconds:
-            w.start = now
+        self._roll_if_elapsed(w, time.time())
         w.count = max(0.0, float(count))
         # Keep the lane split consistent: preserve the auto attribution (clamped
         # to the new total) and assign the remainder to humans.
@@ -599,22 +705,26 @@ class Limiter:
         return self._window_snapshot()
 
     def set_window_start(self, started_at: float | None, metric: str | None = None,
-                         window_seconds: float | None = None) -> dict[str, Any] | None:
+                         window_seconds: float | None = None,
+                         group: str | None = None) -> dict[str, Any] | None:
         """Force rolling-window start timestamps (unix seconds).
 
         `None` clears everything via a full window restart, so the next request
         re-anchors fresh windows. A non-None value is applied to every window
-        matching the optional selectors (all windows when none are given).
-        Returns the new window snapshot, or None when selectors match nothing.
+        matching the optional selectors (all windows when none are given), and
+        to their budget-group siblings — a group is one timer, so a member can
+        never be anchored on its own. Returns the new window snapshot, or None
+        when selectors match nothing.
         """
         if started_at is None:
             self._restart_window()
             return self._window_snapshot()
-        matches = self._select_windows(metric, window_seconds)
+        matches = self._select_windows(metric, window_seconds, group)
         if not matches:
             return None
         for w in matches:
-            w.start = float(started_at)
+            for m in w.siblings:
+                m.start = float(started_at)
         return self._window_snapshot()
 
     def window_state(self) -> dict[str, Any]:
@@ -627,6 +737,7 @@ class Limiter:
         entries = [{
             "metric": w.budget.metric,
             "window_seconds": w.budget.window_seconds,
+            "group": w.budget.group,
             "started_at": w.start,
             "count": w.count,
             "count_human": w.human,
@@ -642,7 +753,11 @@ class Limiter:
 
     def _load_window_entry(self, entry: dict[str, Any],
                            taken: set[int]) -> bool:
-        """Restore one persisted window entry into a matching live window."""
+        """Restore one persisted window entry into a matching live window.
+
+        The budget group is matched too, but only when the entry carries one
+        (a file written before groups existed restores by metric + length).
+        """
         try:
             start = float(entry["started_at"])
             metric = str(entry.get("metric", "requests"))
@@ -651,12 +766,15 @@ class Limiter:
             auto = max(0.0, float(entry.get("count_auto", 0) or 0))
         except (KeyError, TypeError, ValueError):
             return False
+        group = entry.get("group") if "group" in entry else _ANY_GROUP
         if time.time() - start >= window_seconds:
             return False  # already elapsed
         for i, w in enumerate(self._windows):
             if i in taken:
                 continue
             if w.budget.metric != metric or w.budget.window_seconds != window_seconds:
+                continue
+            if group is not _ANY_GROUP and w.budget.group != group:
                 continue
             taken.add(i)
             w.start = start
@@ -676,8 +794,10 @@ class Limiter:
         """Restore persisted windows, discarding any that already elapsed.
 
         v2 files carry one entry per budget window, matched to the current
-        active tier's budgets by (metric, window_seconds) — entries whose
-        budget no longer exists or whose window has elapsed are dropped. A
+        active tier's budgets by (metric, window_seconds, group) — entries
+        whose budget no longer exists or whose window has elapsed are dropped.
+        Budgets left dormant inside a group that did restore adopt its timer
+        (`_sync_group_starts`), so a group always comes back on one clock. A
         legacy (pre-budgets) file restores its single request window into the
         first requests budget, using the saved duration for the elapsed check.
         Returns True if anything was restored.
@@ -691,7 +811,9 @@ class Limiter:
             for entry in entries:
                 if isinstance(entry, dict) and entry.get("started_at") is not None:
                     restored |= self._load_window_entry(entry, taken)
-            if not restored:
+            if restored:
+                self._sync_group_starts()
+            else:
                 log.info("window: persisted state elapsed or unmatched; discarded")
             return restored
         # Legacy single-window format: {started_at, count, count_auto, window_seconds}
@@ -717,6 +839,7 @@ class Limiter:
         target.count = count
         target.auto = min(auto, count)
         target.human = count - target.auto
+        self._sync_group_starts()  # siblings of the restored budget share its timer
         log.info(f"window: restored count={count} "
                  f"(human={target.human} auto={target.auto}) started_at={start}")
         return True

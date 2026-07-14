@@ -130,6 +130,50 @@ def test_yaml_block_matches_model_pricing_schema(tmp_path):
     assert "cache_creation" not in yaml_block   # no cache-write tokens seen
 
 
+def test_split_mode_keeps_prices_unblended(tmp_path):
+    cal = Calibrator(str(tmp_path / "cal.json"))
+    _feed(cal, [
+        {"haiku": {"input": 0, "cache_read": 0, "output": 0}},
+        {"haiku": {"input": 3_000_000, "cache_read": 2_000_000,
+                   "output": 1_000_000}},
+    ])
+    res = cal.solve()
+    assert "blended" not in res["models"]["haiku"]["input"]
+    assert set(res["residuals"]) == {"cost_output", "cost_input_cached",
+                                     "cost_input_uncached"}
+
+
+def test_no_cached_token_data_blends_the_input_price(tmp_path):
+    # Upstream reports no cached-token count, so the proxy lumps all 5M prompt
+    # tokens into `input` — while the provider still bills 1M of them as
+    # uncached ($15/Mtok) and 4M as cached ($1.5/Mtok). The only price that can
+    # (and should) come out is the blended (15 + 6) / 5 = $4.20/Mtok.
+    cal = Calibrator(str(tmp_path / "cal.json"))
+    for i, (inp, out) in enumerate([(0, 0), (5_000_000, 1_000_000)]):
+        cal.add_snapshot(
+            {"cost_input_uncached": (inp / 5) * 15.0 / 1e6,
+             "cost_input_cached": (inp * 4 / 5) * 1.5 / 1e6,
+             "cost_output": out * 75.0 / 1e6},
+            {"opus": {"input": inp, "cache_creation": 0, "cache_read": 0,
+                      "output": out}},
+            at=1000.0 + i,
+        )
+    res = cal.solve()
+    p = res["models"]["opus"]
+    assert abs(p["input"]["price"] - 4.2) < 1e-6
+    assert p["input"]["blended"] is True and p["input"]["confidence"] == "direct"
+    assert p["output"]["price"] == 75.0 and "blended" not in p["output"]
+    assert "cache_read" not in p  # never observed -> no unknown, no price
+    # Both input counters are accounted for in one residual, fully explained.
+    assert set(res["residuals"]) == {"cost_output",
+                                     "cost_input_uncached+cost_input_cached"}
+    for r in res["residuals"].values():
+        assert abs(r["unexplained"]) < 1e-6
+    assert any("blended" in n for n in res["notes"])
+    assert "    input: 4.2  # blended: cached + uncached input" \
+        in res["model_pricing_yaml"]
+
+
 def test_corrupt_file_tolerated(tmp_path):
     path = tmp_path / "cal.json"
     path.write_text("{broken")

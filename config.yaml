@@ -25,22 +25,38 @@ throttle_listen_port: 8788
 # evaluated and the most constraining ("binding") one sets the pace. Per
 # budget, in that budget's units (requests, tokens, or $):
 #   usable = limit - used
-#            - human_demand_safety * human_rate * units_per_request
+#            - human_demand_safety * human_rate * units_per_request(human)
 #                                  * min(time_left, lookahead)
 #            - human_quota_floor                     (requests budgets only)
-#   rate   = (usable / units_per_request) / time_left
+#   rate   = (usable / units_per_request(auto)) / time_left
 # so it holds back what humans are *statistically predicted* to still need.
-# units_per_request converts requests <-> tokens/$ via a live per-request EWMA
-# (the auto_assumed_* values below apply before any traffic). As a window nears
-# its end the prediction term shrinks to ~0, letting automation drain up to
-# 100% of what's left. The rate is also capped by the physical pipe (free
-# slots / measured avg request time), and concurrency stays bounded by
-# max_concurrent (with human priority).
+# units_per_request converts requests <-> tokens/$ via live PER-LANE
+# per-request EWMAs (the auto_assumed_* values below apply before any
+# traffic): predicted human demand is sized from what human requests actually
+# consume, and the leftover is turned into a request rate from what auto
+# requests actually consume — interactive Claude Code requests (100k+ cached
+# tokens each) and small scripted requests differ by orders of magnitude, and
+# blending them made auto far too slow. Windows shorter than
+# human_reserve_min_window_seconds skip the predicted-human term entirely (see
+# below). As a window nears its end the prediction term shrinks to ~0, letting
+# automation drain up to 100% of what's left. The rate is also capped by the
+# physical pipe (free slots / measured avg request time), and concurrency
+# stays bounded by max_concurrent (with human priority).
+#
+# NOTE: for pacing to orient on COST budgets, model_pricing (bottom of this
+# file) must cover the models you use — unpriced models bill $0, so the cost
+# EWMA is 0 and cost budgets can neither fill nor bind. Use the ⚖ Calibrate
+# dashboard dialog / GET /_proxy/calibrate/prices to derive prices.
 auto_pacing_enabled: true
 human_demand_safety: 1.5            # >1 leaves more headroom for humans (slower auto)
 human_demand_horizon_seconds: 3600  # window over which the human request rate is measured
 human_demand_lookahead_seconds: 3600  # cap on how far ahead that rate is projected when reserving quota
                                       # (keeps a long e.g. 5h window from reserving nearly all quota off a small human rate)
+human_reserve_min_window_seconds: 300 # windows SHORTER than this get no predicted-human reservation:
+                                      # a per-minute limit recovers in <=60s and humans are protected
+                                      # there by queue priority + upstream 429 retries, so reserving on
+                                      # it only starves auto — the reservation belongs to the long
+                                      # (e.g. 5h cost) budgets. 0 = reserve on every window (old behavior).
 human_quota_floor: 0                # hard floor of requests always kept free for humans (0 = purely statistical)
 auto_concurrency_reserve: 0         # slots reserved for humans (auto capped at max_concurrent - this; 0 = rely on priority)
 auto_assumed_request_seconds: 30.0  # avg request time assumed before any latency is measured
@@ -92,6 +108,17 @@ scheduled_low_at: null
 # budget is the "binding" one shown by the dashboard/statusline, and the
 # auto-lane pacer paces against whichever budget is most constraining.
 #
+# GROUPS: an optional `group` name puts several budgets on ONE shared timer —
+# they anchor together on the first request and roll together, instead of each
+# re-anchoring whenever the next request/completion happens to touch it. This
+# is what upstream per-minute limits actually look like: one 60s clock counting
+# requests AND tokens AND dollars, not three clocks that drift apart. Because a
+# group IS one window, all its budgets must declare the same `window_seconds`
+# (an entry that disagrees is logged and left on its own timer). Budgets with
+# no `group` stay independent, exactly as before. The dashboard names the group
+# on each quota card, and /_proxy/window/{count,start} take a "group" selector
+# (anchoring any member anchors the whole group).
+#
 # There is still no preemptive human-lane enforcement: humans are admitted as
 # fast as max_concurrent allows, and when upstream rate-limits (429/503/529)
 # the proxy retries with backoff so callers wait then. The proxy auto-detects
@@ -108,18 +135,18 @@ scheduled_low_at: null
 tiers:
   low:
     max_concurrent: 4                                        # concurrent requests
-    limits:
-      - {metric: requests, limit: 20,     window_seconds: 60}     # 20 req/min
-      - {metric: tokens,   limit: 500000, window_seconds: 60}     # 500k tokens/min
-      - {metric: cost,     limit: 50,     window_seconds: 60}     # $50/min
-      - {metric: cost,     limit: 30,     window_seconds: 18000}  # $30 per 5h
+    limits:                                                            # one 60s clock ("minute"):
+      - {metric: requests, limit: 20,     window_seconds: 60,    group: minute}    # 20 req/min
+      - {metric: tokens,   limit: 500000, window_seconds: 60,    group: minute}    # 500k tokens/min
+      - {metric: cost,     limit: 50,     window_seconds: 60,    group: minute}    # $50/min
+      - {metric: cost,     limit: 30,     window_seconds: 18000, group: session}   # $30 per 5h
   high:
     max_concurrent: 1000                                     # concurrent requests
     limits:
-      - {metric: requests, limit: 1000,   window_seconds: 60}     # 1000 req/min
-      - {metric: tokens,   limit: 500000, window_seconds: 60}     # 500k tokens/min
-      - {metric: cost,     limit: 50,     window_seconds: 60}     # $50/min
-      - {metric: cost,     limit: 100,    window_seconds: 3600}   # $100 per 1h
+      - {metric: requests, limit: 1000,   window_seconds: 60,    group: minute}    # 1000 req/min
+      - {metric: tokens,   limit: 500000, window_seconds: 60,    group: minute}    # 500k tokens/min
+      - {metric: cost,     limit: 50,     window_seconds: 60,    group: minute}    # $50/min
+      - {metric: cost,     limit: 100,    window_seconds: 3600,  group: session}   # $100 per 1h
 # Legacy example (single request window per tier):
 # tiers:
 #   low:
@@ -220,7 +247,10 @@ calibration_persist_path: "calibration.json"
 # whatever unit your provider bills in — dollars, credits, etc.).
 # - If a model isn't listed, its cost shows as "—" on the dashboard AND it
 #   contributes $0 to any cost budgets in `tiers.*.limits` — configure pricing
-#   for every model you use if you rely on cost budgets.
+#   for every model you use if you rely on cost budgets. With no pricing at
+#   all, cost budgets are invisible to the auto-lane pacer too (a $0
+#   per-request estimate can't be converted into a request rate), so pacing
+#   falls through to the requests/tokens budgets.
 # - If cache_creation / cache_read are omitted, they default to the input rate.
 # Uncomment + edit to your provider's actual rates.
 model_pricing: {}

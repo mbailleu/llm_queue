@@ -28,6 +28,30 @@ def test_parse_budgets_drops_invalid_entries():
     assert len(budgets) == 1 and budgets[0].metric == "requests"
 
 
+def test_parse_budgets_reads_groups():
+    cfg = cfg_with({"low": {"max_concurrent": 4, "limits": [
+        {"metric": "requests", "limit": 20, "window_seconds": 60, "group": "minute"},
+        {"metric": "tokens", "limit": 500000, "window_seconds": 60, "group": "minute"},
+        {"metric": "cost", "limit": 30, "window_seconds": 18000, "group": "session"},
+        {"metric": "cost", "limit": 50, "window_seconds": 60},          # ungrouped
+    ]}})
+    budgets = parse_budgets(cfg, "low")
+    assert [b.group for b in budgets] == ["minute", "minute", "session", None]
+
+
+def test_parse_budgets_ungroups_a_budget_that_disagrees_on_window_length():
+    # A group is ONE window, so a member declaring a different length can't join
+    # it — the budget survives (its quota still needs tracking), on its own timer.
+    cfg = cfg_with({"low": {"max_concurrent": 4, "limits": [
+        {"metric": "requests", "limit": 20, "window_seconds": 60, "group": "minute"},
+        {"metric": "cost", "limit": 30, "window_seconds": 18000, "group": "minute"},
+    ]}})
+    budgets = parse_budgets(cfg, "low")
+    assert len(budgets) == 2
+    assert budgets[0].group == "minute"
+    assert budgets[1].group is None and budgets[1].window_seconds == 18000
+
+
 def test_parse_budgets_all_invalid_falls_back_to_none():
     cfg = cfg_with({"low": {"max_concurrent": 4, "limits": [
         {"metric": "bogus", "limit": 1, "window_seconds": 1},

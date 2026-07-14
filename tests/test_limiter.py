@@ -163,6 +163,101 @@ def test_windows_roll_independently():
     assert _win(snap, "requests")["count"] == 1
 
 
+# ---- budget groups (budgets sharing one timer) ----
+
+def make_grouped_limiter(**kw) -> Limiter:
+    """LOW: requests + tokens on one 60s "minute" clock; cost on its own timer."""
+    low = Tier("low", 2, budgets=[
+        Budget("requests", 10, 60, group="minute"),
+        Budget("tokens", 1000, 60, group="minute"),
+        Budget("cost", 5.0, 300),
+    ])
+    return make_limiter(low=low, **kw)
+
+
+def test_group_members_anchor_and_roll_together():
+    lim = make_grouped_limiter()
+    w, _ = lim.note_request("m", "human")
+    lim.note_done(w, "human")
+    lim.note_usage(100, 1.0, "human")
+    snap = lim.window_snapshot()
+    assert _win(snap, "requests")["started_at"] == _win(snap, "tokens")["started_at"]
+    # Age the group past its 60s window. The next completion touches only the
+    # tokens budget, but its group sibling (requests) shares the timer and must
+    # roll with it — ungrouped budgets keep their own clock.
+    lim.set_window_start(time.time() - 61, group="minute")
+    lim.note_usage(50, 0.5, "human")
+    snap = lim.window_snapshot()
+    assert _win(snap, "tokens")["count"] == 50        # fresh window
+    assert _win(snap, "requests")["count"] == 0       # rolled with its group
+    assert _win(snap, "requests")["started_at"] == _win(snap, "tokens")["started_at"]
+    assert _win(snap, "cost")["count"] == 1.5         # own timer, kept accumulating
+
+
+def test_set_window_start_moves_the_whole_group():
+    lim = make_grouped_limiter()
+    lim.note_request("m", "human")
+    t = time.time() - 30
+    lim.set_window_start(t, metric="tokens")          # selector hits one member...
+    snap = lim.window_snapshot()
+    assert _win(snap, "requests")["started_at"] == t  # ...the group moves as one
+    assert _win(snap, "tokens")["started_at"] == t
+    assert _win(snap, "cost")["started_at"] != t      # ungrouped, untouched
+
+
+def test_new_budget_joins_a_running_groups_clock():
+    async def run():
+        lim = make_grouped_limiter()
+        lim.note_request("m", "human")
+        lim.note_usage(200, 1.0, "human")
+        start = _win(lim.window_snapshot(), "requests")["started_at"]
+        # Config reload adds a $50/min budget to the running "minute" group.
+        new_low = Tier("low", 2, budgets=[
+            Budget("requests", 10, 60, group="minute"),
+            Budget("tokens", 1000, 60, group="minute"),
+            Budget("cost", 50, 60, group="minute"),
+            Budget("cost", 5.0, 300),
+        ])
+        await lim.update_tiers(new_low, Tier("high", 100, 50, 1000), 300.0, None)
+        snap = lim.window_snapshot()
+        added = _win(snap, "cost", 60)
+        assert added["active"] and added["count"] == 0    # empty, but running...
+        assert added["started_at"] == start               # ...on the group's clock
+        assert _win(snap, "tokens")["count"] == 200       # survivors keep their state
+    asyncio.run(run())
+
+
+def test_group_window_state_roundtrip():
+    lim = make_grouped_limiter()
+    w, _ = lim.note_request("m", "auto")
+    lim.note_usage(200, 0.75, "auto")
+    lim.note_done(w, "auto")
+    state = lim.window_state()
+    assert [e["group"] for e in state["windows"]] == ["minute", "minute", None]
+    fresh = make_grouped_limiter()
+    assert fresh.load_window_state(state)
+    snap = fresh.window_snapshot()
+    assert _win(snap, "requests")["count"] == 1 and _win(snap, "tokens")["count"] == 200
+    assert _win(snap, "requests")["started_at"] == _win(snap, "tokens")["started_at"]
+
+
+def test_restored_group_adopts_its_clock_for_a_budget_added_while_down():
+    lim = make_grouped_limiter()
+    lim.note_request("m", "human")
+    state = lim.window_state()                      # saved without a cost/60s budget
+    grown = Tier("low", 2, budgets=[
+        Budget("requests", 10, 60, group="minute"),
+        Budget("tokens", 1000, 60, group="minute"),
+        Budget("cost", 50, 60, group="minute"),     # added to the group while down
+    ])
+    fresh = make_limiter(low=grown)
+    assert fresh.load_window_state(state)
+    snap = fresh.window_snapshot()
+    added = _win(snap, "cost", 60)
+    assert added["active"] and added["count"] == 0
+    assert added["started_at"] == _win(snap, "requests")["started_at"]
+
+
 def test_discount_only_reverses_unrolled_requests_windows():
     low = Tier("low", 2, budgets=[Budget("requests", 10, 100),
                                   Budget("requests", 100, 50)])
@@ -204,6 +299,26 @@ def test_units_per_request_ewma_and_fallbacks():
     assert lim.units_per_request("cost") == 1.0
     lim.note_usage(800, 2.0)
     assert lim.units_per_request("tokens") == 0.2 * 800 + 0.8 * 400
+
+
+def test_units_per_request_per_lane():
+    lim = make_budget_limiter()
+    lim.set_assumed_units(1000, 0.02)
+    # No data anywhere: every lane falls back to the assumed values.
+    assert lim.units_per_request("tokens", "auto") == 1000
+    assert lim.units_per_request("cost", "human") == 0.02
+    lim.note_usage(500, 0.25, "human")
+    # Human lane measured; auto has no data yet and falls back to the blended
+    # EWMA (currently human-only).
+    assert lim.units_per_request("tokens", "human") == 500
+    assert lim.units_per_request("tokens", "auto") == 500
+    lim.note_usage(10, 0.01, "auto")
+    # Each lane now reports its own traffic; the blended EWMA sits between.
+    assert lim.units_per_request("tokens", "auto") == 10
+    assert lim.units_per_request("tokens", "human") == 500
+    assert 10 < lim.units_per_request("tokens") < 500
+    assert lim.units_per_request("cost", "auto") == 0.01
+    assert lim.units_per_request("requests", "auto") == 1.0
 
 
 def test_set_window_count_with_selectors():

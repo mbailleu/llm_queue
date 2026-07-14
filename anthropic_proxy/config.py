@@ -48,6 +48,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # min(time_left, this). Capping the projection stops a long (e.g. 5h LOW)
     # window from reserving almost the entire quota off a small human rate.
     "human_demand_lookahead_seconds": 3600,
+    # Budget windows SHORTER than this (seconds) carry no predicted-human
+    # reservation at all: a per-minute window recovers within seconds and the
+    # human lane is protected there by queue priority + upstream 429 retries,
+    # so reserving on it only starves auto. The reservation stays on the long
+    # (e.g. 5h cost) budgets, which are the ones auto could durably exhaust.
+    # Set 0 to reserve on every window (the old behavior).
+    "human_reserve_min_window_seconds": 300,
     # Optional hard floor of requests always kept free for humans (0 = purely
     # statistical, the default the user asked for).
     "human_quota_floor": 0,
@@ -185,6 +192,12 @@ def parse_budgets(cfg: dict[str, Any], name: str) -> list[Budget] | None:
     bad config line can't silently change the quota tracking. Returns None
     when the tier has no usable `limits` at all — the caller then falls back
     to the legacy single request-window keys.
+
+    An optional `group` name puts budgets on ONE shared timer (they anchor and
+    roll together). Since a group is a single window, its members must all
+    declare the same `window_seconds`; an entry that disagrees with the group's
+    first-seen length keeps its limit but is left ungrouped (on its own timer)
+    rather than being dropped — the quota still needs tracking.
     """
     t = (cfg.get("tiers") or {}).get(name) or {}
     raw = t.get("limits")
@@ -194,6 +207,7 @@ def parse_budgets(cfg: dict[str, Any], name: str) -> list[Budget] | None:
         log.warning(f"tiers.{name}.limits must be a list; ignored")
         return None
     budgets: list[Budget] = []
+    group_lengths: dict[str, float] = {}
     for entry in raw:
         if not isinstance(entry, dict):
             log.warning(f"tiers.{name}.limits entry {entry!r} not a mapping; ignored")
@@ -214,7 +228,16 @@ def parse_budgets(cfg: dict[str, Any], name: str) -> list[Budget] | None:
             log.warning(f"tiers.{name}.limits entry {entry!r}: limit and "
                         f"window_seconds must be > 0; ignored")
             continue
-        budgets.append(Budget(metric, limit, window_seconds))
+        group = str(entry.get("group", "") or "").strip() or None
+        if group is not None:
+            expected = group_lengths.setdefault(group, window_seconds)
+            if expected != window_seconds:
+                log.warning(
+                    f"tiers.{name}.limits entry {entry!r}: group {group!r} is one "
+                    f"shared window of {expected:.0f}s, but this budget declares "
+                    f"{window_seconds:.0f}s; keeping the budget on its own timer")
+                group = None
+        budgets.append(Budget(metric, limit, window_seconds, group=group))
     if not budgets:
         log.warning(f"tiers.{name}.limits has no valid entries; "
                     f"falling back to the legacy window keys")
