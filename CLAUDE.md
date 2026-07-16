@@ -225,11 +225,17 @@ testable on its own.
   predicted human demand is sized from what human requests actually consume,
   while the leftover is turned into auto requests at auto's own (often much
   smaller) per-request size. Windows **shorter than
-  `human_reserve_min_window_seconds`** (default 300) skip the predicted-human
-  term entirely — a per-minute window recovers in ≤60s and humans are
-  protected there by queue priority + upstream 429 retries, so the
-  reservation lives on the long (e.g. 5h cost) budgets. Inactive windows,
-  windows about to roll, and unconvertible ones
+  `auto_pace_min_window_seconds`** (default 300) are **exempt from pacing
+  entirely** — they never bind the rate and never park auto, even when fully
+  spent; a per-minute limit self-heals in ≤60s, so overruns there are
+  throttled by the lane's own mechanisms (the concurrency queue + the
+  upstream 429 retry/backoff loop) while pacing lives on the long (e.g. 5h
+  cost) budgets. Exempt windows are still evaluated (entry `paces: False`) so
+  the dashboard keeps their leftover/projection. Independently, windows
+  shorter than `human_reserve_min_window_seconds` (default 300) skip the
+  predicted-human term — humans are protected on them by queue priority +
+  upstream 429 retries, so the reservation too lives on the long budgets.
+  Inactive windows, windows about to roll, and unconvertible ones
   (`units_per_request ≤ 0`, e.g. cost with no pricing — which can't fill
   either) can never bind. `_usable_and_rate()` stays the 2-tuple wrapper. The
   `min(…, lookahead)` (`human_demand_lookahead_seconds`) stops a long (e.g. 5h)

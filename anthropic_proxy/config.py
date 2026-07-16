@@ -55,6 +55,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # (e.g. 5h cost) budgets, which are the ones auto could durably exhaust.
     # Set 0 to reserve on every window (the old behavior).
     "human_reserve_min_window_seconds": 300,
+    # Budget windows SHORTER than this (seconds) don't pace the auto lane at
+    # all: they never set the auto admission rate and never park auto, even
+    # when fully spent. A per-minute limit self-heals in <=60s, so throttling
+    # there is left to the lane's own mechanisms — the concurrency queue plus
+    # the upstream 429 retry/backoff loop — while pacing lives on the long
+    # (e.g. 5h cost) budgets. Set 0 to pace on every window (the old behavior).
+    "auto_pace_min_window_seconds": 300,
     # Optional hard floor of requests always kept free for humans (0 = purely
     # statistical, the default the user asked for).
     "human_quota_floor": 0,

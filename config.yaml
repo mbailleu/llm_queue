@@ -37,6 +37,8 @@ throttle_listen_port: 8788
 # requests actually consume — interactive Claude Code requests (100k+ cached
 # tokens each) and small scripted requests differ by orders of magnitude, and
 # blending them made auto far too slow. Windows shorter than
+# auto_pace_min_window_seconds don't pace at all (overruns there are throttled
+# by the queue + upstream 429 backoff instead), and windows shorter than
 # human_reserve_min_window_seconds skip the predicted-human term entirely (see
 # below). As a window nears its end the prediction term shrinks to ~0, letting
 # automation drain up to 100% of what's left. The rate is also capped by the
@@ -57,6 +59,11 @@ human_reserve_min_window_seconds: 300 # windows SHORTER than this get no predict
                                       # there by queue priority + upstream 429 retries, so reserving on
                                       # it only starves auto — the reservation belongs to the long
                                       # (e.g. 5h cost) budgets. 0 = reserve on every window (old behavior).
+auto_pace_min_window_seconds: 300     # windows SHORTER than this don't pace auto AT ALL — they never set
+                                      # the admission rate and never park auto, even when fully spent.
+                                      # Overruns on them are throttled by the lane's own mechanisms
+                                      # (concurrency queue + upstream 429 retry/backoff); pacing lives on
+                                      # the long budgets. 0 = pace on every window (old behavior).
 human_quota_floor: 0                # hard floor of requests always kept free for humans (0 = purely statistical)
 auto_concurrency_reserve: 0         # slots reserved for humans (auto capped at max_concurrent - this; 0 = rely on priority)
 auto_assumed_request_seconds: 30.0  # avg request time assumed before any latency is measured

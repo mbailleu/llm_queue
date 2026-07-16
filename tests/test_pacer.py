@@ -21,6 +21,9 @@ def make_setup(window_seconds=100.0, window_limit=10, human_events=0,
         "auto_poll_seconds": 0.05,
         "human_demand_lookahead_seconds": 3600,
         "human_demand_horizon_seconds": 3600,
+        # Tests exercise the pacing math on short windows; the production
+        # default exempts windows shorter than 300s from pacing entirely.
+        "auto_pace_min_window_seconds": 0,
     }
     cfg.update(cfg_overrides or {})
     return lim, AutoPacer(lim, met, cfg)
@@ -145,6 +148,7 @@ def make_multi_setup(budgets, assumed=(100.0, 0.01), cfg_overrides=None):
         "auto_poll_seconds": 0.05,
         "human_demand_lookahead_seconds": 3600,
         "human_demand_horizon_seconds": 3600,
+        "auto_pace_min_window_seconds": 0,
     }
     cfg.update(cfg_overrides or {})
     return lim, AutoPacer(lim, met, cfg)
@@ -216,6 +220,77 @@ def test_human_reservation_sized_by_human_lane_estimate():
     # Sizing it with the auto estimate (10 tok/req) would have reserved only
     # 360 tokens and allowed ~19500.
     assert 1300 <= usable <= 1600
+
+
+# ---- short-window pacing exemption (auto_pace_min_window_seconds) ----
+
+def test_spent_short_window_neither_binds_nor_parks():
+    # A fully spent per-minute window must not pace auto at all — throttling
+    # there is the queue's + upstream 429 backoff's job. With no other budget
+    # the gate is simply open.
+    lim, pacer = make_setup(window_seconds=60, window_limit=2,
+                            cfg_overrides={"auto_pace_min_window_seconds": 300})
+    lim.note_request("m", "human")
+    lim.note_request("m", "human")     # minute window fully spent
+    usable, rate = pacer._usable_and_rate()
+    assert rate == float("inf")
+    assert pacer.status()["reason"] == "open"
+
+
+def test_short_window_exempt_pacing_falls_to_long_budget():
+    # Spent requests/min window + healthy 5h cost budget: the long budget sets
+    # the pace and auto keeps flowing instead of parking for the minute.
+    lim, pacer = make_multi_setup([Budget("requests", 2, 60),
+                                   Budget("cost", 30.0, 18000)],
+                                  assumed=(100.0, 0.01),
+                                  cfg_overrides={"auto_pace_min_window_seconds": 300})
+    lim.note_request("m", "human")
+    lim.note_request("m", "human")     # requests/min fully spent
+    usable, rate = pacer._usable_and_rate()
+    assert usable > 0 and rate > 0
+    st = pacer.status()
+    assert st["reason"] == "paced"
+    assert st["binding_metric"] == "cost"
+    assert st["binding_window_seconds"] == 18000
+    # The exempt window is still evaluated for the dashboard.
+    assert st["windows"][0]["usable_units"] is not None
+
+
+def test_pace_min_window_zero_restores_short_window_pacing():
+    lim, pacer = make_setup(window_seconds=60, window_limit=2,
+                            cfg_overrides={"auto_pace_min_window_seconds": 0})
+    lim.note_request("m", "human")
+    lim.note_request("m", "human")
+    usable, rate = pacer._usable_and_rate()
+    assert usable <= 0 and rate == 0.0     # old behavior: spent window parks
+
+
+def test_cost_pacing_with_cheap_model_is_not_punitive():
+    # Fictional model at $0.50/Mtok input, $1.60/Mtok output: a 20k-in/2k-out
+    # request costs $0.0132, so a $30/5h cost budget leaves ~2200 requests —
+    # the pace must come out in whole requests per minute, not a crawl.
+    lim = Limiter(Tier("low", 4, budgets=[Budget("cost", 30.0, 18000)]),
+                  Tier("high", 100, 50, 1000), "low", 300.0, None)
+    met = Metrics(pricing={"fict": {"input": 0.50, "output": 1.60}})
+    pacer = AutoPacer(lim, met, {
+        "auto_pacing_enabled": True,
+        "human_demand_safety": 1.5,
+        "human_quota_floor": 0,
+        "auto_assumed_request_seconds": 30.0,
+        "auto_poll_seconds": 0.05,
+    })
+    cost = met.cost_of("fict", {"input_tokens": 20000, "output_tokens": 2000})
+    assert abs(cost - 0.0132) < 1e-9
+    lim.note_request("fict", "auto")       # anchors the window
+    for _ in range(5):                     # auto cost EWMA converges to $0.0132
+        lim.note_usage(22000, cost, "auto")
+    usable, rate = pacer._usable_and_rate()
+    # usable = (30 - 5*0.0132) / 0.0132 ~ 2268 requests over <=5h
+    assert 2200 <= usable <= 2300
+    assert 7.0 <= rate * 60 <= 8.0         # ~7.6 req/min even-spread
+    st = pacer.status()
+    assert st["reason"] == "paced"
+    assert st["binding_metric"] == "cost"
 
 
 def test_status_exposes_per_window_projections():

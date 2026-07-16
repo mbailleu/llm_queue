@@ -38,12 +38,19 @@ class AutoPacer:
     sized with the human lane's EWMA, while the leftover is converted into auto
     requests with the auto lane's — the two kinds of traffic can differ in size
     by orders of magnitude. Windows shorter than
-    `human_reserve_min_window_seconds` skip the predicted-human term entirely:
-    they recover within seconds and the human lane is protected there by queue
+    `auto_pace_min_window_seconds` are exempt from pacing entirely: they never
+    bind the rate and never park auto, even when fully spent. A per-minute
+    limit self-heals within seconds, so throttling there is left to the lane's
+    own mechanisms — the concurrency queue (with human priority) plus the
+    upstream 429 retry/backoff loop — while pacing lives on the long (e.g. 5h
+    cost) budgets. Exempt windows are still evaluated so the dashboard can show
+    their leftover/projection. Independently, windows shorter than
+    `human_reserve_min_window_seconds` skip the predicted-human term: they
+    recover within seconds and the human lane is protected there by queue
     priority + upstream 429 retries, so reserving on them only starves auto —
-    the reservation belongs to the long (e.g. 5h cost) budgets. The final rate
-    is the minimum across budgets, additionally capped by physical throughput
-    (free slots / avg request time).
+    the reservation belongs to the long budgets. The final rate is the minimum
+    across pacing budgets, additionally capped by physical throughput (free
+    slots / avg request time).
 
     As a window nears its end, `remaining -> 0`, the predicted-human term
     vanishes, and automation is free to drain whatever is left (up to ~100%).
@@ -84,6 +91,11 @@ class AutoPacer:
         # class docstring); 0 reserves on every window.
         self._reserve_min_window = max(
             0.0, float(cfg.get("human_reserve_min_window_seconds", 300)))
+        # Windows shorter than this don't pace at all — they can neither bind
+        # the rate nor park auto; the queue + upstream 429 backoff throttle
+        # them instead (see class docstring). 0 paces on every window.
+        self._pace_min_window = max(
+            0.0, float(cfg.get("auto_pace_min_window_seconds", 300)))
 
     def _evaluate(self) -> dict[str, Any]:
         """Evaluate every budget window and pick the binding (slowest) one.
@@ -94,7 +106,10 @@ class AutoPacer:
         of the binding window in the limiter snapshot (None when open), and
         `windows` has one entry per snapshot window (None for windows that
         can't constrain: inactive, about to roll, or unpriced-cost) with
-        {metric, window_seconds, usable_units, usable_reqs, rate, count_auto}.
+        {metric, window_seconds, usable_units, usable_reqs, rate, paces,
+        count_auto}. Entries with paces=False (windows shorter than
+        auto_pace_min_window_seconds) are evaluated for display only and are
+        never picked as binding.
         """
         snap = self._limiter.window_snapshot()
         wins = snap.get("windows") or []
@@ -132,6 +147,10 @@ class AutoPacer:
             limit = float(w["limit"])
             used = float(w["count"])
             window_seconds = float(w.get("window_seconds") or 0.0)
+            # Short windows are exempt from pacing: their entry is computed
+            # for the dashboard, but they never bind and never park auto —
+            # the queue + upstream 429 backoff throttle overruns there.
+            paces = window_seconds >= self._pace_min_window
             if window_seconds < self._reserve_min_window:
                 # Short windows self-heal within seconds and the human lane is
                 # protected there by queue priority + upstream 429 retries —
@@ -159,9 +178,10 @@ class AutoPacer:
                 "usable_units": usable_units,
                 "usable_reqs": usable_reqs,
                 "rate": rate,
+                "paces": paces,
                 "count_auto": float(w.get("count_auto", 0) or 0),
             })
-            if binding is None or rate < entries[binding]["rate"]:
+            if paces and (binding is None or rate < entries[binding]["rate"]):
                 binding = i
         if binding is None:
             # No budget can constrain right now — let the request through (it
