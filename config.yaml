@@ -45,6 +45,12 @@ throttle_listen_port: 8788
 # physical pipe (free slots / measured avg request time), and concurrency
 # stays bounded by max_concurrent (with human priority).
 #
+# If the pace ever looks wrong, don't guess: the dashboard's Auto Pacing card
+# spells the whole calculation out (hover it for every term — which budget binds,
+# what the human reserve costs, why the others don't count), and each quota card
+# carries its own budget's arithmetic. Same text in JSON under `pacer.explain` in
+# GET /_proxy/metrics.
+#
 # NOTE: for pacing to orient on COST budgets, model_pricing (bottom of this
 # file) must cover the models you use — unpriced models bill $0, so the cost
 # EWMA is 0 and cost budgets can neither fill nor bind. Use the ⚖ Calibrate
@@ -164,6 +170,36 @@ tiers:
 #     max_concurrent: 1000
 #     window_seconds: 3600      # 1h
 #     window_limit: 99999       # per-hour ceiling once promoted to HIGH
+
+# --- Adaptive HIGH concurrency ---
+# On HIGH, `max_concurrent` above is an UPPER BOUND, not a target. The real
+# ceiling is whatever parallelism upstream tolerates before it starts throwing
+# 429s — with a 500k tokens/minute limit that is reached at some concurrency no
+# config can predict, and demoting the whole tier on every 429 collapses
+# throughput to LOW's 4 slots over and over.
+#
+# With this enabled, a rate-limit while on HIGH instead SHRINKS the concurrency
+# estimate and keeps the tier:
+#   new_cap = max(min_concurrent, floor(in_flight_at_the_429 * decrease_factor))
+# using the concurrency actually observed at the 429 (so a cap of 1000 that only
+# ever sees 30 parallel requests still converges in one step), at most once per
+# cooldown so one overload burst counts as one signal. It grows back by
+# increase_step every increase_after successes that ran while the cap was
+# actually saturated — an idle lane never ratchets it back up.
+# Only when the estimate has bottomed out at min_concurrent and upstream STILL
+# rate-limits does the old HIGH->LOW demotion happen (see demote_at_min): at
+# LOW-level parallelism, pushback means the tier is wrong, not the concurrency.
+# Entering HIGH again restarts the search from start_concurrent.
+# LOW is never adapted. The dashboard's In Flight card shows the live estimate.
+high_adaptive_concurrency: true
+high_adaptive_min_concurrent: 4       # never search below this (LOW's cap is a sane floor)
+high_adaptive_max_concurrent: null    # extra ceiling; null = tiers.high.max_concurrent
+high_adaptive_start_concurrent: null  # estimate when HIGH starts; null = the ceiling
+high_adaptive_decrease_factor: 0.5    # multiplicative decrease from the observed concurrency
+high_adaptive_increase_step: 1        # slots added per increase
+high_adaptive_increase_after: 20      # saturated successes needed per increase
+high_adaptive_cooldown_seconds: 15.0  # quiet period after a decrease (also blocks growth)
+high_adaptive_demote_at_min: true     # false = stay HIGH forever, just at min_concurrent
 
 # After a HIGH->LOW demotion (or a failed probe), wait this many seconds before
 # trying to probe HIGH again.

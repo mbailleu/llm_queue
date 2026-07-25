@@ -304,3 +304,83 @@ def test_status_exposes_per_window_projections():
     assert tok["metric"] == "tokens"
     # projected_auto (token units) = 200 spent + leftover usable units
     assert tok["projected_auto"] >= 200
+
+
+# ---- explanation of the current rate ----
+
+def test_explain_shows_the_binding_budget_arithmetic():
+    lim, pacer = make_multi_setup([Budget("requests", 100, 600)])
+    lim._started_at = time.monotonic() - 3600
+    for _ in range(36):                    # human_rate = 0.01 req/s
+        lim._note_human()
+    lim.note_request("m", "human")
+    text = "\n".join(pacer.explain())
+    assert "requests/10min" in text
+    assert "limit 100" in text and "spent 1" in text
+    assert "Human reserve = 1 safety" in text
+    assert "req/min" in text
+    assert "Throughput cap:" in text
+
+
+def test_explain_names_the_reserve_when_it_parks_auto():
+    lim, pacer = make_multi_setup([Budget("requests", 10, 3600)])
+    lim._started_at = time.monotonic() - 3600
+    for _ in range(3600):                  # a human rate that eats the budget
+        lim._note_human()
+    lim.note_request("m", "human")
+    st = pacer.status()
+    assert st["reason"] == "reserved"
+    text = "\n".join(st["explain"])
+    assert "human reserve alone parks automation" in text
+    assert "human_demand_safety" in text and "human_demand_lookahead_seconds" in text
+
+
+def test_explain_marks_windows_that_cannot_pace():
+    lim, pacer = make_multi_setup([Budget("requests", 2, 60),
+                                   Budget("cost", 30.0, 18000)],
+                                  cfg_overrides={"auto_pace_min_window_seconds": 300})
+    lim.note_request("m", "human")
+    st = pacer.status()
+    short, long_ = st["windows"][0], st["windows"][1]
+    assert short["paces"] is False and long_["paces"] is True
+    assert any("Not pacing" in s for s in short["explain"])
+    assert st["binding_index"] == 1        # the short window never binds
+    assert "not paced" in "\n".join(st["explain"])
+
+
+def test_explain_handles_idle_and_open_windows():
+    lim, pacer = make_setup(window_seconds=600, window_limit=10)
+    st = pacer.status()                    # nothing has anchored the window yet
+    assert st["reason"] == "open"
+    assert st["binding_index"] is None
+    assert st["windows"][0]["paces"] is True     # long enough, just not started
+    assert any("idle" in s for s in st["windows"][0]["explain"])
+    assert "no budget can pace" in "\n".join(st["explain"]).lower()
+
+
+def test_explain_reports_disabled_pacing():
+    lim, pacer = make_setup(cfg_overrides={"auto_pacing_enabled": False})
+    st = pacer.status()
+    assert st["binding_index"] is None
+    assert "disabled" in "\n".join(st["explain"]).lower()
+
+
+def test_status_windows_flag_unconvertible_budgets():
+    lim, pacer = make_multi_setup([Budget("requests", 10, 600),
+                                   Budget("cost", 5.0, 600)],
+                                  assumed=(100.0, 0.0))
+    lim.note_request("m", "human")
+    cost = pacer.status()["windows"][1]
+    assert cost["usable_units"] is None and cost["binds"] is False
+    assert any("neither fill nor" in s for s in cost["explain"])
+
+
+def test_capacity_cap_uses_the_effective_concurrency():
+    # The adaptive HIGH estimate, not the tier's configured max, is what the
+    # throughput cap divides by.
+    lim, pacer = make_multi_setup([Budget("requests", 100000, 600)])
+    lim._active = lim._high
+    lim.set_adaptive_params(enabled=True, min_concurrent=1, max_concurrent=10)
+    lim.note_request("m", "human")
+    _, rate = pacer._usable_and_rate()
+    assert rate <= 10.0 / 1.0 + 1e-9       # 10 slots / 1s assumed avg

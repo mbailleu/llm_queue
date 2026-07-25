@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import math
 import time
 from collections import deque
 from typing import Any
@@ -169,6 +170,27 @@ class Limiter:
         self._human_waiters = 0
         self._auto_waiters = 0
         self._auto_concurrency_reserve = 0
+        # Adaptive HIGH-tier concurrency (AIMD). The HIGH tier's max_concurrent
+        # is an upper bound, not a target: a token/minute limit is reached at a
+        # concurrency the config can't know, and demoting the whole tier on
+        # every 429 collapses throughput to LOW. Instead the limiter searches
+        # for the concurrency upstream actually tolerates — multiplicative
+        # decrease from the concurrency observed at the rate-limit, additive
+        # increase while saturated and clean. `_adaptive_limit` is the learned
+        # cap (None = nothing learned yet, use the start/ceiling); it applies
+        # only while HIGH is active and is bounded by [floor, ceiling].
+        self._adaptive_enabled = False
+        self._adaptive_min = 1
+        self._adaptive_max: int | None = None      # None -> the HIGH tier's cap
+        self._adaptive_start: int | None = None    # None -> start at the ceiling
+        self._adaptive_factor = 0.5
+        self._adaptive_step = 1
+        self._adaptive_increase_after = 20
+        self._adaptive_cooldown = 15.0
+        self._adaptive_demote_at_min = True
+        self._adaptive_limit: float | None = None
+        self._adaptive_last_decrease = 0.0
+        self._adaptive_successes = 0
         # Requests currently parked in retry backoff after upstream pushback
         # (429/503/529 — e.g. the backend's own quota limit, which the proxy does
         # not enforce but does wait out). These hold no concurrency slot and are
@@ -241,11 +263,27 @@ class Limiter:
         self._n_promotions = 0
         self._n_demotions = 0
         self._n_probes_sent = 0
+        self._n_adaptive_down = 0
+        self._n_adaptive_up = 0
 
     @property
     def active(self) -> Tier:
         """The currently active tier (read-only; switches happen internally)."""
         return self._active
+
+    @property
+    def effective_max_concurrent(self) -> int:
+        """The concurrency cap in force right now.
+
+        The active tier's `max_concurrent`, except while HIGH is active with
+        adaptive concurrency enabled — then it's the learned estimate, clamped
+        to [adaptive floor, adaptive ceiling]. Every admission decision, the
+        pacer's throughput cap, and the dashboard read this rather than
+        `active.max_concurrent`.
+        """
+        if not self._adaptive_enabled or self._active is not self._high:
+            return self._active.max_concurrent
+        return self._adaptive_estimate()
 
     @property
     def forced(self) -> str | None:
@@ -379,6 +417,14 @@ class Limiter:
         # calling here. Demotions to LOW don't wake: a demotion means upstream
         # just rate-limited us, so sleepers should keep backing off.
         if self._active is self._high:
+            # A new HIGH stint restarts the adaptive concurrency search from its
+            # start value. Carrying the old estimate over would mean arriving
+            # back on HIGH already at the floor, where the next rate-limit
+            # demotes immediately — exactly the flapping adaptivity exists to
+            # avoid.
+            self._adaptive_limit = None
+            self._adaptive_successes = 0
+            self._adaptive_last_decrease = 0.0
             ev = self._rl_wake
             self._rl_wake = asyncio.Event()
             ev.set()
@@ -864,10 +910,11 @@ class Limiter:
             try:
                 while True:
                     now = time.monotonic()
-                    free = self._in_flight < self._active.max_concurrent
+                    cap = self.effective_max_concurrent
+                    free = self._in_flight < cap
 
                     if is_auto:
-                        auto_cap = max(0, self._active.max_concurrent - self._auto_concurrency_reserve)
+                        auto_cap = max(0, cap - self._auto_concurrency_reserve)
                         if free and self._human_waiters == 0 and self._auto_in_flight < auto_cap:
                             self._in_flight += 1
                             self._auto_in_flight += 1
@@ -958,6 +1005,138 @@ class Limiter:
         self._auto_concurrency_reserve = max(0, int(concurrency_reserve))
         self._human_horizon = max(1.0, float(human_horizon))
 
+    # -- adaptive HIGH concurrency (AIMD search for the tolerated parallelism) --
+
+    def _adaptive_ceiling(self) -> int:
+        """Upper bound of the search: the HIGH tier's cap, optionally lowered."""
+        top = self._high.max_concurrent
+        if self._adaptive_max is not None:
+            top = min(top, self._adaptive_max)
+        return max(1, int(top))
+
+    def _adaptive_floor(self) -> int:
+        """Lower bound of the search (never below 1, never above the ceiling)."""
+        return max(1, min(int(self._adaptive_min), self._adaptive_ceiling()))
+
+    def _adaptive_estimate(self) -> int:
+        """The current concurrency estimate for HIGH, clamped to its bounds.
+
+        Independent of which tier is active: it is what HIGH would run at right
+        now (LOW is never adapted), which is what the dashboard reports.
+        """
+        cur = self._adaptive_limit
+        if cur is None:
+            cur = self._adaptive_start if self._adaptive_start is not None \
+                else self._adaptive_ceiling()
+        return int(max(self._adaptive_floor(), min(self._adaptive_ceiling(), cur)))
+
+    def set_adaptive_params(self, *, enabled: bool = False,
+                            min_concurrent: int = 1,
+                            max_concurrent: int | None = None,
+                            start_concurrent: int | None = None,
+                            decrease_factor: float = 0.5,
+                            increase_step: int = 1,
+                            increase_after: int = 20,
+                            cooldown_seconds: float = 15.0,
+                            demote_at_min: bool = True) -> None:
+        """Configure the adaptive HIGH concurrency search (hot-reloadable).
+
+        A learned estimate already in effect is kept, re-clamped to the new
+        bounds — a config edit tunes the search without discarding what the
+        upstream has already told us.
+        """
+        self._adaptive_enabled = bool(enabled)
+        self._adaptive_min = max(1, int(min_concurrent))
+        self._adaptive_max = int(max_concurrent) if max_concurrent else None
+        self._adaptive_start = int(start_concurrent) if start_concurrent else None
+        self._adaptive_factor = min(0.99, max(0.05, float(decrease_factor)))
+        self._adaptive_step = max(1, int(increase_step))
+        self._adaptive_increase_after = max(1, int(increase_after))
+        self._adaptive_cooldown = max(0.0, float(cooldown_seconds))
+        self._adaptive_demote_at_min = bool(demote_at_min)
+        if self._adaptive_limit is not None:
+            self._adaptive_limit = max(self._adaptive_floor(),
+                                       min(self._adaptive_ceiling(), self._adaptive_limit))
+
+    def _shrink_adaptive(self, observed: int) -> bool:
+        """Multiplicative decrease after upstream pushback while on HIGH.
+
+        `observed` is the in-flight count at the moment the request was
+        rate-limited (including itself) — that, not the configured cap, is the
+        concurrency upstream actually rejected, so a cap of 1000 that only ever
+        sees 30 parallel requests still converges in one step. Returns True if
+        the cap moved; False when the cooldown is still running (a burst of
+        429s from one overload is one signal, not ten) or the floor is reached.
+        Sync + await-free; callers hold `self._cond`.
+        """
+        now = time.monotonic()
+        if now - self._adaptive_last_decrease < self._adaptive_cooldown:
+            return False
+        cur = self.effective_max_concurrent
+        floor = self._adaptive_floor()
+        if cur <= floor:
+            return False
+        base = min(cur, max(1, int(observed)))
+        new = max(floor, int(math.floor(base * self._adaptive_factor)))
+        if new >= cur:
+            new = cur - 1  # already at/below the observed concurrency: step down
+        self._adaptive_limit = float(new)
+        self._adaptive_last_decrease = now
+        self._adaptive_successes = 0
+        self._n_adaptive_down += 1
+        log.warning(f"adaptive concurrency: {cur} -> {new} after a rate-limit at "
+                    f"{observed} in flight (floor {floor}, ceiling {self._adaptive_ceiling()})")
+        return True
+
+    def _grow_adaptive(self, observed: int) -> None:
+        """Additive increase after a run of clean, *saturated* successes.
+
+        Only saturation counts: growing the cap while it isn't the constraint
+        would ratchet it back to the ceiling on idle traffic and undo the
+        search. The post-decrease cooldown applies here too, so requests that
+        were already in flight when the cap shrank can't immediately undo it.
+        Sync + await-free; callers hold `self._cond`.
+        """
+        now = time.monotonic()
+        if now - self._adaptive_last_decrease < self._adaptive_cooldown:
+            return
+        cur = self.effective_max_concurrent
+        if cur >= self._adaptive_ceiling():
+            self._adaptive_successes = 0
+            return
+        if observed < cur and self._waiters == 0:
+            return  # the cap isn't what's holding traffic back
+        self._adaptive_successes += 1
+        if self._adaptive_successes < self._adaptive_increase_after:
+            return
+        self._adaptive_successes = 0
+        new = min(self._adaptive_ceiling(), cur + self._adaptive_step)
+        self._adaptive_limit = float(new)
+        self._n_adaptive_up += 1
+        log.info(f"adaptive concurrency: {cur} -> {new} after "
+                 f"{self._adaptive_increase_after} saturated successes")
+
+    def adaptive_snapshot(self) -> dict[str, Any]:
+        """Adaptive-concurrency state for the dashboard / statusline."""
+        ceiling = self._adaptive_ceiling()
+        floor = self._adaptive_floor()
+        # The HIGH estimate even while LOW is active, so the card doesn't read
+        # as if the search had collapsed to the LOW tier's cap.
+        limit = self._adaptive_estimate() if self._adaptive_enabled else None
+        return {
+            "enabled": self._adaptive_enabled,
+            "applies": self._adaptive_enabled and self._active is self._high,
+            "limit": limit,
+            "min": floor,
+            "max": ceiling,
+            "learned": self._adaptive_limit is not None,
+            "at_min": limit is not None and limit <= floor,
+            "successes": self._adaptive_successes,
+            "increase_after": self._adaptive_increase_after,
+            "decreases": self._n_adaptive_down,
+            "increases": self._n_adaptive_up,
+        }
+
     # -- rate-limit retry-backoff gauge (a request waiting out upstream
     #    pushback holds no slot and is not a waiter, so track it explicitly).
     #    Sync + await-free: atomic under the single-threaded loop. --
@@ -997,7 +1176,10 @@ class Limiter:
 
     async def release_success(self, was_probe: bool, lane: str = "human") -> None:
         async with self._cond:
+            observed = self._in_flight  # concurrency this request ran at
             self._release_slot(lane)
+            if self._adaptive_enabled and self._active is self._high:
+                self._grow_adaptive(observed)
             if was_probe:
                 self._probe_in_flight = False
                 if self._active is self._low and self._forced is None:
@@ -1012,6 +1194,7 @@ class Limiter:
 
     async def release_rate_limited(self, was_probe: bool, lane: str = "human") -> None:
         async with self._cond:
+            observed = self._in_flight  # concurrency upstream just pushed back on
             self._release_slot(lane)
             self._n_rate_limited += 1
             self._last_rate_limited_at = time.time()
@@ -1021,6 +1204,23 @@ class Limiter:
                 self._last_demotion = now
                 if self._active is self._low:
                     log.info("probe failed; staying LOW, cooldown reset")
+            # On HIGH with adaptive concurrency, a rate-limit means "too many in
+            # parallel", not "you're not on this tier" — shrink the concurrency
+            # estimate and stay HIGH. Only once the search has bottomed out at
+            # its floor (and demote_at_min is on) does a further rate-limit fall
+            # through to the old tier demotion: at that point upstream is
+            # pushing back even at LOW-level parallelism, so the tier really is
+            # wrong. Applies under force_tier="high" too — the cap moves, the
+            # tier doesn't.
+            if self._adaptive_enabled and self._active is self._high:
+                if self._shrink_adaptive(observed):
+                    self._cond.notify_all()
+                    return
+                if not (self._adaptive_demote_at_min
+                        and self.effective_max_concurrent <= self._adaptive_floor()
+                        and now - self._adaptive_last_decrease >= self._adaptive_cooldown):
+                    self._cond.notify_all()
+                    return
             if self._active is self._high and self._forced is None:
                 self._active = self._low
                 self._n_demotions += 1
@@ -1250,7 +1450,11 @@ class Limiter:
         return {
             "active_tier": self._active.name,
             "forced_tier": self._forced,
-            "max_concurrent": self._active.max_concurrent,
+            # The cap actually in force (the adaptive estimate while HIGH);
+            # `tier_max_concurrent` is the tier's configured ceiling.
+            "max_concurrent": self.effective_max_concurrent,
+            "tier_max_concurrent": self._active.max_concurrent,
+            "adaptive": self.adaptive_snapshot(),
             "in_flight": self._in_flight,
             "queued": self._waiters,
             "rate_limited_waiting": self._rl_waiting,
@@ -1274,5 +1478,7 @@ class Limiter:
                 "promotions": self._n_promotions,
                 "demotions": self._n_demotions,
                 "probes_sent": self._n_probes_sent,
+                "adaptive_decreases": self._n_adaptive_down,
+                "adaptive_increases": self._n_adaptive_up,
             },
         }

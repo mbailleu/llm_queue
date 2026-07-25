@@ -167,9 +167,36 @@ rate   = min(rate over all budgets, free_slots / avg_request_time)  # never outr
 - If humans have already spent **any** budget down to that prediction,
   `usable ≤ 0` and automation **parks** until the window advances or resets.
   The dashboard's Auto Pacing card names the budget that currently binds.
-- `avg_request_time` (the tracked EWMA latency) and the tier's concurrency cap
+- `avg_request_time` (the tracked EWMA latency) and the concurrency cap in force
   set the physical ceiling, so the pacer never schedules faster than requests
-  can actually drain. In the low tier that's `max_concurrent` (4) slots.
+  can actually drain. In the low tier that's `max_concurrent` (4) slots; on HIGH
+  it's the [adaptive estimate](#adaptive-high-concurrency).
+- Budgets shorter than `auto_pace_min_window_seconds` (default 300s) are
+  **exempt**: a per-minute limit self-heals in ≤60s, so it never sets the rate
+  and never parks automation — the queue and the 429 backoff throttle it
+  instead. Budgets shorter than `human_reserve_min_window_seconds` likewise
+  carry no predicted-human reservation. Exempt budgets are still tracked and
+  shown; the dashboard marks them **not paced** and never highlights them as
+  binding, however full they are.
+
+**Why is it going this slow?** The pacer keeps every term of that arithmetic and
+explains itself. Hover the dashboard's **Auto Pacing** card for the full
+derivation, or hover any quota card for that budget's own numbers:
+
+```
+Auto pace 7.6 req/min, set by cost/5h (session) (the binding budget).
+cost/5h (session): limit $30.00 − spent $6.50 − human reserve $3.88 = usable $19.62.
+Human reserve = 1.5 safety × 0.42 human req/min × $0.0500 per human request × 1h00m lookahead.
+$19.62 ÷ $0.0132 per auto request = 1.5k requests, spread over the 4h58m left = 5.0 req/min.
+Throughput cap: 4 concurrency slots ÷ 30.0s avg request = 8.0 req/min (not binding).
+Other budgets: requests/1min (minute) not paced (window < 5m), 6 left; …
+```
+
+The same lines come back as JSON in `pacer.explain` (and `pacer.windows[i].explain`)
+from `GET /_proxy/metrics`. When the *reserve alone* is what parks automation,
+the explanation says so and names the two knobs that loosen it
+(`human_demand_safety`, `human_demand_lookahead_seconds`) — a long window plus a
+busy human lane can reserve more than the whole budget.
 
 Real-time spikes are covered separately: automation never occupies a reserved
 slot (`auto_concurrency_reserve`, default 0) and always yields freed slots to
@@ -330,7 +357,38 @@ pile of waiting requests won't block fresh ones.
   ("probe") request through.
 - Probe **succeeds** → upstream is HIGH → promote, new cap is 1000.
 - Probe **gets `429`** → stay LOW, reset cooldown.
-- Any `429 / 503 / 529` while in HIGH → demote back to LOW.
+- A `429 / 503 / 529` while in HIGH → shrink the concurrency estimate (below);
+  only once that has bottomed out does the proxy demote back to LOW.
+
+### Adaptive HIGH concurrency
+
+`tiers.high.max_concurrent` is an *upper bound*, not a target. With a
+500k-tokens/minute budget, upstream starts pushing back at some parallelism no
+config can predict — and treating every `429` as "wrong tier" used to collapse
+throughput to LOW's 4 slots again and again. So on HIGH the proxy searches for
+the concurrency upstream actually tolerates (AIMD):
+
+- **`429` → multiplicative decrease.** The new cap is
+  `max(min, floor(in_flight_at_the_429 × decrease_factor))` — computed from the
+  concurrency *observed* at the rate-limit, so a cap of 1000 that only ever sees
+  30 parallel requests converges in one step. At most one decrease per
+  `high_adaptive_cooldown_seconds`, so one overload burst counts once.
+- **Clean, saturated successes → additive increase.** `+increase_step` every
+  `high_adaptive_increase_after` successes that ran while the cap was actually
+  the constraint. An idle lane never ratchets the cap back up.
+- **The tier stays HIGH** (its budgets, its queue) the whole time. Only when the
+  estimate sits at `high_adaptive_min_concurrent` and upstream *still*
+  rate-limits does the old demotion happen — pushback at LOW-level parallelism
+  means the tier is wrong, not the concurrency. Set
+  `high_adaptive_demote_at_min: false` to never demote.
+- Re-entering HIGH restarts the search from `high_adaptive_start_concurrent`
+  (default: the ceiling). LOW is never adapted. Set
+  `high_adaptive_concurrency: false` for the old demote-on-every-429 behavior.
+
+The dashboard's **In Flight** card shows the live estimate
+(`0 / 32 · adaptive 32 (4–1000)`), and `limiter.adaptive` in `/_proxy/metrics`
+carries the full state (`limiter.max_concurrent` is always the cap actually in
+force; `limiter.tier_max_concurrent` is the configured ceiling).
 
 Probes only fire under load (concurrent requests in flight or queued).
 If you never push past 4 concurrent, the proxy stays LOW indefinitely. To force
@@ -365,11 +423,20 @@ or set `force_tier: high` in `config.yaml` (picked up within ~2s).
 Open <http://127.0.0.1:8787/_proxy/>. Refreshes every 2 seconds.
 
 What's shown:
-- **Current State.** Active tier, in-flight / cap, queued count, a **Lanes** card
-  (human / automation in-flight, paced-auto backlog, observed human rate), the
-  rolling **quota window** (`X / N` requests used, time elapsed / left, with a
-  progress bar), and lifetime counters (rate-limited, promotions, demotions,
-  probes).
+- **Current State.** Active tier, in-flight / cap (plus the adaptive HIGH
+  estimate), queued count, a **Lanes** card (human / automation in-flight,
+  paced-auto backlog, observed human rate), an **Auto Pacing** card, one card
+  per rolling **quota budget** (`X / N` in that budget's units, time elapsed /
+  left, per-lane spend and projections), and lifetime counters (rate-limited,
+  promotions, demotions, probes).
+- **Hover for the math.** Cards with a `?` cursor carry the full derivation of
+  the number they show: Auto Pacing explains the current rate term by term, each
+  quota card explains its own budget, and In Flight explains the adaptive
+  concurrency search. Polling pauses while you hover one, so the tooltip doesn't
+  vanish mid-read.
+- **The highlighted quota card is the one setting the auto-lane pace** ("sets
+  pace"), not merely the fullest one. Budgets too short to pace are labelled
+  *not paced* and are never highlighted.
 - **Throughput.** Per-window request count, average latency, error badge,
   and total cost (if priced). Windows: 1m / 10m / 1h / 5h / 24h.
 - **Overall Latency.** Count, OK, errors, avg, p50, p95 per window.
@@ -542,6 +609,9 @@ and `listen_port` — those require a restart.
 | `auto_pacing_enabled` | `true` | Master switch for automation-lane pacing. |
 | `human_demand_safety` | `1.5` | Multiplier on predicted human demand (higher = more headroom, slower auto). |
 | `human_demand_horizon_seconds` | `3600` | Window over which the human request rate is averaged. |
+| `human_demand_lookahead_seconds` | `3600` | Cap on how far ahead that rate is projected when reserving quota. |
+| `human_reserve_min_window_seconds` | `300` | Budgets shorter than this carry no predicted-human reservation. |
+| `auto_pace_min_window_seconds` | `300` | Budgets shorter than this don't pace automation at all (never bind, never park). |
 | `human_quota_floor` | `0` | Hard floor of requests always kept free for humans (0 = purely statistical). |
 | `auto_concurrency_reserve` | `0` | Concurrency slots reserved for humans (auto capped at `max_concurrent −` this). |
 | `auto_assumed_request_seconds` | `30.0` | Assumed request time before latency is measured. |
@@ -554,6 +624,15 @@ and `listen_port` — those require a restart.
 | `tiers.<tier>.limits` | new-plan budgets | List of `{metric, limit, window_seconds}` quota budgets; metric is `requests` / `tokens` / `cost`. |
 | `tiers.<tier>.window_seconds` | — | **Legacy** quota-window length (used only without `limits`). Falls back to `rate_window_seconds`. |
 | `tiers.<tier>.window_limit` | — | **Legacy** requests-per-window (used only without `limits`). Falls back to `rate_window_limit`. |
+| `high_adaptive_concurrency` | `true` | Search for the tolerated HIGH concurrency instead of demoting on every `429`. |
+| `high_adaptive_min_concurrent` | `4` | Floor of the search. |
+| `high_adaptive_max_concurrent` | `null` | Extra ceiling; `null` = `tiers.high.max_concurrent`. |
+| `high_adaptive_start_concurrent` | `null` | Estimate when HIGH starts; `null` = the ceiling. |
+| `high_adaptive_decrease_factor` | `0.5` | New cap = observed concurrency at the `429` × this. |
+| `high_adaptive_increase_step` | `1` | Slots added per increase. |
+| `high_adaptive_increase_after` | `20` | Saturated successes needed per increase. |
+| `high_adaptive_cooldown_seconds` | `15.0` | Quiet period after a decrease (blocks further decreases *and* growth). |
+| `high_adaptive_demote_at_min` | `true` | At the floor, a further `429` demotes HIGH→LOW; `false` = never demote. |
 | `promotion_cooldown_seconds` | `300` | Min seconds between failed probe / demotion and next probe. |
 | `retry_max_attempts` | `12` | Max **connection-error** retries per request. |
 | `retry_base_delay` / `retry_max_delay` | `1.0` / `60.0` | Exponential backoff bounds. |
@@ -576,9 +655,10 @@ Override the config file path with `CONFIG_PATH=/some/path/config.yaml`.
 
 ## Things to know
 
-- **Concurrency safety on demotion.** When a `429` arrives, the limit is
-  halved only once per `promotion_cooldown_seconds` window — so a burst of
-  concurrent failures won't crash the cap to `1`.
+- **Concurrency safety on pushback.** On HIGH the cap is cut at most once per
+  `high_adaptive_cooldown_seconds` and never below
+  `high_adaptive_min_concurrent`, so a burst of concurrent `429`s counts as one
+  signal instead of crashing the cap.
 - **Streaming.** Forwarded chunk-by-chunk via `httpx.aiter_bytes()`. Responses
   are decoded (gzip stripped), and `content-encoding` is stripped on the way
   out — clients receive identity-encoded bodies.

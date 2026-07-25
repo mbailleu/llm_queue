@@ -10,7 +10,9 @@ an upstream LLM endpoint, forwarding every path/header/body verbatim while addin
 
 - **A shared concurrency queue** with two auto-detected tiers (LOW / HIGH),
   each tracking a set of rolling quota budgets (requests / tokens / cost per
-  window — the legacy single request-window config style still works).
+  window — the legacy single request-window config style still works). On HIGH
+  the concurrency cap is **searched for** (AIMD on upstream 429s) rather than
+  taken from config.
 - **Retry + backoff** on upstream rate limits (429/503/529), so callers wait
   instead of failing.
 - **Token / cost metrics** that understand Anthropic Messages, OpenAI Chat
@@ -72,6 +74,8 @@ testable on its own.
   arms the daily switches, restores `window.json`, returns the `AppState`.
 - `apply_config_change(state, new_cfg)`: applies a reloaded config live (incl.
   `limiter.set_auto_params()` + `limiter.set_assumed_units()` +
+  `apply_adaptive_config()` (the `high_adaptive_*` keys; a learned concurrency
+  estimate survives, re-clamped to the new bounds) +
   `pacer.configure()` + the shared client's `upstream_timeout`). Only
   `upstream_base_url` / host / the two ports need a restart; everything else
   hot-reloads.
@@ -107,8 +111,9 @@ testable on its own.
 - `local_tod_seconds()` / `next_time_of_day()`: local time-of-day helpers for
   the daily switch recurrence.
 - `Limiter`: the heart of the queue. An `asyncio.Condition`
-  guards `in_flight` / `waiters`. Read-only `active` / `forced` properties
-  expose the current tier. Key methods:
+  guards `in_flight` / `waiters`. Read-only `active` / `forced` /
+  `effective_max_concurrent` properties expose the current tier and the cap
+  actually in force. Key methods:
   - `acquire(lane)`: admits a request for the `"human"` or `"auto"` lane, or
     **probes HIGH** when LOW is saturated and the promotion cooldown has elapsed.
     Returns `was_probe`. **Human priority**: auto is never admitted while a human
@@ -116,8 +121,27 @@ testable on its own.
     only humans probe.
   - `release_success` / `release_rate_limited` / `release_other_error` (each
     takes `lane`): release a slot via `_release_slot()` and drive **auto-tier
-    switching** — a successful probe promotes LOW→HIGH; any rate-limit demotes
-    HIGH→LOW.
+    switching** — a successful probe promotes LOW→HIGH; a rate-limit on HIGH
+    demotes to LOW *unless* adaptive concurrency absorbs it (below).
+  - **Adaptive HIGH concurrency (AIMD).** `set_adaptive_params()` (config
+    `high_adaptive_*`, hot-reloaded via `apply_adaptive_config`),
+    `_shrink_adaptive()` / `_grow_adaptive()`, `_adaptive_estimate()` /
+    `_adaptive_floor()` / `_adaptive_ceiling()`, `adaptive_snapshot()`. On HIGH
+    the tier's `max_concurrent` is an upper bound: a 429 shrinks the estimate to
+    `floor(in_flight_at_the_429 × factor)` — **the observed concurrency, not the
+    configured cap**, so a 1000 cap that only ever runs 30 in parallel converges
+    in one step — at most once per `cooldown`, and the tier is kept. Successes
+    grow it by `step` every `increase_after` completions **that ran saturated**
+    (`observed >= cap` or waiters present); unsaturated successes must never
+    grow it or an idle lane ratchets back to the ceiling. Only when the estimate
+    is at its floor and a further rate-limit arrives (past the cooldown) does
+    `release_rate_limited` fall through to the old demotion — and only if
+    `demote_at_min`. Applies under `force_tier="high"` too (the cap moves, the
+    tier doesn't). **`_restart_window` clears the estimate whenever the active
+    tier lands on HIGH**, so a new HIGH stint re-searches instead of arriving at
+    the floor where the first 429 demotes it again. LOW is never adapted.
+    `effective_max_concurrent` (NOT `active.max_concurrent`) is what `acquire`,
+    the pacer's throughput cap, and `snapshot()["max_concurrent"]` read.
   - `boost_high()`: manual temporary jump to HIGH (auto-demotes on the next
     rate-limit). Distinct from `force_tier` which pins a tier.
   - `set_daily_switch()` / `set_oneshot_switch()` (LOW→HIGH) +
@@ -215,7 +239,10 @@ testable on its own.
 ### `pacer.py` — automation-lane pacing
 - `AutoPacer`: paces the `"auto"` lane so it spends only the *leftover* quota.
   `gate()` blocks an auto request until it may proceed. `_evaluate()` scores
-  **every budget window** and the **binding** (slowest) one sets the pace: per
+  **every budget window** (one `_evaluate_window()` call each, which keeps every
+  intermediate term and a `skip` reason of
+  `inactive`/`rolling`/`unconvertible`) and the **binding** (slowest) one sets
+  the pace: per
   budget, in its own units, `usable_units = limit − used −
   safety·human_rate·units_per_request(human)·min(time_left, lookahead) − floor`
   (floor for requests budgets only), converted back to requests via
@@ -250,12 +277,23 @@ testable on its own.
   Timing uses `time.monotonic()` (not the event-loop clock), so `status()`
   works outside a running loop (e.g. in tests). `_parked` counts requests held
   in `gate()`; `status()` exposes `{parked, usable, rate_per_min, next_seconds,
-  reason, count_auto, projected_auto, binding_metric, binding_window_seconds,
-  windows}` — `windows` aligns by index with the limiter snapshot's windows and
-  carries each budget's `usable_units` + `projected_auto` in its own units for
-  the dashboard quota cards; top-level `usable` is in requests and
-  `projected_auto` follows the snapshot's binding window. `configure()` is
-  re-called on config reload. The human lane never touches the pacer.
+  reason, count_auto, projected_auto, binding_index, binding_metric,
+  binding_window_seconds, explain, windows}` — `windows` aligns by index with
+  the limiter snapshot's windows and carries each budget's `usable_units` +
+  `projected_auto` in its own units, its `paces`/`binds` flags and its own
+  `explain` lines for the dashboard quota cards; top-level `usable` is in
+  requests and `projected_auto` follows the snapshot's binding window.
+  `configure()` is re-called on config reload. The human lane never touches the
+  pacer.
+- **`explain()` / `_explain_window()`** render the kept terms as sentences (not
+  an aligned table — the dashboard shows them in a native `title` tooltip, which
+  uses a proportional font): which budget binds, each term of its arithmetic,
+  the throughput cap, and a roll-up of the other budgets. When the
+  predicted-human reserve alone is what parks auto, the text says so and names
+  `human_demand_safety` / `human_demand_lookahead_seconds` — that combination
+  (long window × busy human lane) is the usual cause of "pacing is too
+  aggressive". Any new term in the pacing math belongs in the entry dict AND in
+  these lines; an explanation that drifts from the code is worse than none.
 
 ### `calibrate.py` — per-model price calibration (pure, no FastAPI)
 - `Calibrator`: stores snapshots pairing the provider's **cumulative cost
@@ -386,13 +424,26 @@ Self-contained vanilla HTML/CSS/JS, no build step. `app.js` polls
 `/_proxy/metrics` (2s) and `/_proxy/series` (15s) and draws SVG charts. The
 files are read per request, so dashboard edits show up on browser reload
 without restarting the proxy. The state grid renders **one quota card per
-budget window** (from `limiter.window.windows`, `.stat.binding` highlights the
-most-utilized one; a window's `group` is appended to its card label, so members
-of one shared timer are visibly a set) with per-lane spend + projections
+budget window** (from `limiter.window.windows`; a window's `group` is appended
+to its card label, so members of one shared timer are visibly a set) with
+per-lane spend + projections
 (`projected_human` from
 the limiter snapshot, `projected_auto` from `pacer.windows[i]`, index-aligned);
 a one-entry list is synthesized from the top-level mirror if a stale poll ever
-lacks `windows`. The header's **⚖ Calibrate** button opens a native `<dialog>`
+lacks `windows`.
+- **`.stat.binding` = the budget that sets the auto pace** (`pacer.binding_index`),
+  *not* the most-utilized window — a per-minute budget that can't pace must never
+  be highlighted (it's labelled `not paced` instead, from `pacer.windows[i].paces`).
+  Only with no pacer window data at all (pacing off) does it fall back to the
+  limiter snapshot's utilization mirror.
+- **Hover-to-explain**: cards carrying a server-built derivation get
+  `class="has-why"` + a `title` attribute (`pacer.explain`,
+  `pacer.windows[i].explain`, and the adaptive-concurrency text on In Flight).
+  Because `#state-grid` is re-rendered wholesale every poll — which would destroy
+  the hovered element and its tooltip — `tick()` **skips the grid update while
+  `.has-why:hover` matches**. Keep that guard when touching the render path, and
+  run everything server-built through `esc()`.
+The header's **⚖ Calibrate** button opens a native `<dialog>`
 (price-calibration form → `POST /_proxy/calibrate/snapshot`, estimates table +
 paste-ready YAML from `GET /_proxy/calibrate/prices`, two-step reset button —
 no blocking `confirm()`).

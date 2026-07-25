@@ -161,6 +161,18 @@ function pct(used, max) {
   if (!max) return 0;
   return Math.min(100, (used / max) * 100);
 }
+const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
+function esc(s) {
+  // Server-built explanation text goes into title="" attributes and text nodes.
+  return String(s ?? "").replace(/[&<>"]/g, (c) => ESC[c]);
+}
+function whyLine(P) {
+  // The single most informative line of the pacing explanation: the binding
+  // budget's arithmetic (limit − spent − reserve = usable), else the headline.
+  const w = (P.windows || [])[P.binding_index];
+  const lines = (w && w.explain && w.explain.length ? w.explain : P.explain) || [];
+  return lines[0] || "";
+}
 async function tick() {
   try {
     const r = await fetch("/_proxy/metrics");
@@ -187,6 +199,23 @@ async function tick() {
     const tierClass = L.active_tier === "high" ? "tier-high" : "tier-low";
     const concPct = pct(L.in_flight, L.max_concurrent);
     const concClass = concPct >= 95 ? "crit" : concPct >= 75 ? "warn" : "";
+    // Adaptive HIGH concurrency: max_concurrent is the *learned* cap while the
+    // search is running, so say where it sits between floor and ceiling.
+    const A = L.adaptive || {};
+    let adaptSub = "", adaptTitle = "";
+    if (A.applies) {
+      const ceiling = L.tier_max_concurrent ?? A.max;
+      adaptSub = ` · adaptive ${A.limit} (${A.min}–${A.max})`;
+      adaptTitle = esc(
+        `Adaptive HIGH concurrency: searching for the parallelism upstream tolerates.\n` +
+        `Cap now ${A.limit}, bounded by ${A.min} (high_adaptive_min_concurrent) and ` +
+        `${A.max}${A.max !== ceiling ? "" : " (the tier's max_concurrent)"}.\n` +
+        `A 429 halves it from the concurrency observed at the time; ` +
+        `${A.increase_after} saturated successes add a slot (${A.successes} so far).\n` +
+        `${A.decreases} decrease(s), ${A.increases} increase(s) so far.` +
+        (A.at_min ? `\nAt the floor: a further rate-limit demotes to LOW ` +
+                    `(unless high_adaptive_demote_at_min is off).` : ""));
+    }
     const rlWait = L.rate_limited_waiting || 0;
     const rlAgo = L.last_rate_limited_at ? ((Date.now()/1000) - L.last_rate_limited_at) : null;
     const rlSub = rlWait > 0
@@ -198,7 +227,6 @@ async function tick() {
     // shape (no `windows` list) is synthesized into a one-entry list so a
     // stale poll during a live upgrade still renders.
     const wins = W.windows || (W.limit != null ? [W] : []);
-    const bindingIdx = W.binding ?? 0;
     const lanes = L.lanes || {human:{in_flight:0,queued:0}, auto:{in_flight:0,queued:0,concurrency_reserve:0}, human_rate_per_min:0};
     const autoQ = lanes.auto.queued || 0;
     const laneCard = `
@@ -224,11 +252,14 @@ async function tick() {
     if (P.binding_metric && wins.length > 1 && (P.reason === "paced" || P.reason === "reserved")) {
       paceSub += ` · ${P.binding_metric}/${fmtWinLen(P.binding_window_seconds)} binds`;
     }
+    // Hovering the card shows the whole derivation of the current rate (which
+    // budget binds, every term of its arithmetic, why the others don't count).
     const paceCard = `
-      <div class="stat">
+      <div class="stat has-why" title="${esc((P.explain || []).join("\n"))}">
         <div class="label">Auto Pacing</div>
         <div class="value ${paceClass}">${paceVal}</div>
         <div class="sub">${paceSub}</div>
+        <div class="sub why">${esc(whyLine(P))}</div>
       </div>`;
 
     // One quota card per budget window: "used / limit" in the budget's own
@@ -237,6 +268,19 @@ async function tick() {
     // per-window status, aligned by index). The most-utilized budget is the
     // "binding" one and gets highlighted.
     const pWins = P.windows || [];
+    // Which quota card gets highlighted. "Binding" means "sets the auto-lane
+    // pace" — so it is the PACER's binding budget, never a window that is too
+    // short to pace (auto_pace_min_window_seconds) even when it is the most
+    // utilized one. With pacing off (no per-window pacer data) there is no such
+    // notion, so fall back to the limiter's most-utilized window.
+    let bindingIdx;
+    if (!pWins.length) {
+      bindingIdx = W.binding ?? 0;
+    } else if (P.binding_index != null) {
+      bindingIdx = P.binding_index;
+    } else {
+      bindingIdx = -1;   // no budget can pace right now: highlight nothing
+    }
     const winCards = wins.map((w, i) => {
       const metric = w.metric || "requests";
       const noun = METRIC_NOUN[metric] ?? metric;
@@ -246,9 +290,13 @@ async function tick() {
       const label = "Quota · " + fmtUnits(metric, w.limit) + (noun ? " " + noun : "")
         + " / " + fmtWinLen(w.window_seconds) + (w.group ? " · " + w.group : "");
       const isBinding = wins.length > 1 && i === bindingIdx && w.active;
+      // Windows too short to pace are marked so their utilization isn't read as
+      // something that throttles automation.
+      const noPace = pWins.length > 0 && pWins[i] && !pWins[i].paces && w.active;
+      const why = esc(((pWins[i] && pWins[i].explain) || []).join("\n"));
       if (!w.active) {
         return `
-        <div class="stat">
+        <div class="stat"${why ? ` title="${why}"` : ""}>
           <div class="label">${label}</div>
           <div class="value">idle</div>
           <div class="sub">starts on next request</div>
@@ -275,8 +323,8 @@ async function tick() {
       const pa = (pWins[i] && pWins[i].projected_auto != null)
         ? pWins[i].projected_auto : (P.projected_auto ?? ca);
       return `
-        <div class="stat${isBinding ? " binding" : ""}">
-          <div class="label">${label}${isBinding ? " · binding" : ""}</div>
+        <div class="stat${isBinding ? " binding" : ""}${why ? " has-why" : ""}"${why ? ` title="${why}"` : ""}>
+          <div class="label">${label}${isBinding ? " · sets pace" : noPace ? " · <span class=\"muted\">not paced</span>" : ""}</div>
           <div class="value ${useClass}">${fmtUnits(metric, w.count)} / ${fmtUnits(metric, w.limit)}</div>
           <div class="sub">${fmtSpan(w.elapsed_seconds)} in · ${leftSub}</div>
           <div class="sub">human ${fmtUnits(metric, ch)}→~${fmtUnits(metric, ph, true)} · auto ${fmtUnits(metric, ca)}→~${fmtUnits(metric, pa, true)}</div>
@@ -298,17 +346,22 @@ async function tick() {
         ? "daily @" + sched.low_daily_at + " (in " + fmtSpan(sched.low_seconds_until) + ")"
         : "in " + fmtSpan(sched.low_seconds_until)));
     }
-    document.getElementById("state-grid").innerHTML = `
+    // Cards carrying a title="" derivation are re-rendered every poll, which
+    // would destroy the element a native tooltip belongs to — and the tooltip
+    // with it. While one of them is hovered, leave the grid alone; the rest of
+    // the page (and the live clock) keeps updating.
+    const grid = document.getElementById("state-grid");
+    const gridHtml = `
       <div class="stat">
         <div class="label">Active Tier</div>
         <div class="value ${tierClass}">${L.active_tier.toUpperCase()}</div>
         <div class="sub">${L.forced_tier ? "forced" : "auto"}${L.probe_in_flight ? " · probing" : ""}</div>
         ${schedSubs.map((s) => `<div class="sub">${s}</div>`).join("")}
       </div>
-      <div class="stat">
+      <div class="stat"${adaptTitle ? ` title="${adaptTitle}"` : ""}>
         <div class="label">In Flight</div>
         <div class="value ${concClass}">${L.in_flight} / ${L.max_concurrent}</div>
-        <div class="sub">${concPct.toFixed(0)}%</div>
+        <div class="sub">${concPct.toFixed(0)}%${adaptSub}</div>
       </div>
       <div class="stat">
         <div class="label">Queued</div>
@@ -331,6 +384,7 @@ async function tick() {
         </div>
       </div>
     `;
+    if (!grid.querySelector(".has-why:hover")) grid.innerHTML = gridHtml;
 
     let tpHtml = "";
     for (const w of WINDOWS) {

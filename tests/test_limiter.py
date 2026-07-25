@@ -565,3 +565,150 @@ def test_window_snapshot_shortened_by_pending_switch():
     assert snap["switch_at"] is not None
     assert snap["effective_remaining_seconds"] <= 10
     assert snap["remaining_seconds"] > 90
+
+
+# ---- adaptive HIGH concurrency (AIMD) ----
+
+def make_adaptive_limiter(**params) -> Limiter:
+    lim = make_limiter(low=Tier("low", 4, 100, 10),
+                       high=Tier("high", 1000, 60, 1000),
+                       initial_tier="high")
+    args = dict(enabled=True, min_concurrent=4, decrease_factor=0.5,
+                increase_after=3, cooldown_seconds=0.0)
+    args.update(params)
+    lim.set_adaptive_params(**args)
+    return lim
+
+
+async def _rate_limit_at(lim: Limiter, in_flight: int) -> None:
+    """Simulate a 429 arriving while `in_flight` requests were running."""
+    lim._in_flight = in_flight
+    await lim.release_rate_limited(False, "human")
+
+
+def test_rate_limit_shrinks_concurrency_instead_of_demoting():
+    async def run():
+        lim = make_adaptive_limiter()
+        assert lim.effective_max_concurrent == 1000
+        await _rate_limit_at(lim, 40)
+        # Halved from the concurrency actually observed, not from the cap.
+        assert lim.effective_max_concurrent == 20
+        assert lim.active.name == "high"
+        assert lim.snapshot()["totals"]["demotions"] == 0
+    asyncio.run(run())
+
+
+def test_shrink_respects_cooldown():
+    async def run():
+        lim = make_adaptive_limiter(cooldown_seconds=60.0)
+        await _rate_limit_at(lim, 40)
+        assert lim.effective_max_concurrent == 20
+        await _rate_limit_at(lim, 20)              # burst from the same overload
+        assert lim.effective_max_concurrent == 20  # unchanged inside the cooldown
+        assert lim.active.name == "high"
+    asyncio.run(run())
+
+
+def test_saturated_successes_grow_concurrency_but_idle_ones_do_not():
+    async def run():
+        lim = make_adaptive_limiter()
+        await _rate_limit_at(lim, 40)              # estimate: 20
+        for _ in range(3):                         # increase_after=3, saturated
+            lim._in_flight = lim.effective_max_concurrent
+            await lim.release_success(False, "human")
+        assert lim.effective_max_concurrent == 21
+        for _ in range(30):                        # far below the cap: no growth
+            lim._in_flight = 1
+            await lim.release_success(False, "human")
+        assert lim.effective_max_concurrent == 21
+    asyncio.run(run())
+
+
+def test_growth_stops_at_the_ceiling():
+    async def run():
+        lim = make_adaptive_limiter(max_concurrent=8, increase_after=1)
+        await _rate_limit_at(lim, 8)               # 8 -> 4 (the floor)
+        assert lim.effective_max_concurrent == 4
+        for _ in range(20):
+            lim._in_flight = lim.effective_max_concurrent
+            await lim.release_success(False, "human")
+        assert lim.effective_max_concurrent == 8   # capped by high_adaptive_max
+    asyncio.run(run())
+
+
+def test_demotes_only_once_the_search_bottoms_out():
+    async def run():
+        lim = make_adaptive_limiter()
+        for observed in (40, 20, 10, 6, 4):
+            await _rate_limit_at(lim, observed)
+            if lim.active.name == "low":
+                break
+        assert lim.effective_max_concurrent == 4   # LOW's own cap now
+        assert lim.active.name == "low"
+        assert lim.snapshot()["totals"]["demotions"] == 1
+    asyncio.run(run())
+
+
+def test_no_demotion_at_floor_when_disabled():
+    async def run():
+        lim = make_adaptive_limiter(demote_at_min=False)
+        for observed in (40, 20, 10, 6, 4, 4):
+            await _rate_limit_at(lim, observed)
+        assert lim.active.name == "high"
+        assert lim.snapshot()["adaptive"]["at_min"] is True
+    asyncio.run(run())
+
+
+def test_adaptive_shrinks_under_forced_high():
+    async def run():
+        lim = make_adaptive_limiter(demote_at_min=False)
+        lim._forced = "high"
+        await _rate_limit_at(lim, 40)
+        assert lim.effective_max_concurrent == 20 and lim.active.name == "high"
+    asyncio.run(run())
+
+
+def test_promotion_restarts_the_search():
+    async def run():
+        lim = make_adaptive_limiter()
+        for observed in (40, 20, 10, 6, 4):
+            await _rate_limit_at(lim, observed)
+            if lim.active.name == "low":
+                break
+        assert lim.active.name == "low"
+        await lim.boost_high()                     # back to HIGH
+        assert lim.effective_max_concurrent == 1000  # fresh search, not the floor
+    asyncio.run(run())
+
+
+def test_disabled_adaptive_keeps_the_old_demotion():
+    async def run():
+        lim = make_adaptive_limiter(enabled=False)
+        await _rate_limit_at(lim, 40)
+        assert lim.active.name == "low"
+        assert lim.effective_max_concurrent == 4   # LOW's configured cap
+    asyncio.run(run())
+
+
+def test_acquire_honors_the_adaptive_cap():
+    async def run():
+        lim = make_adaptive_limiter(max_concurrent=2)
+        assert await lim.acquire("human") is False
+        assert await lim.acquire("human") is False
+        blocked = asyncio.create_task(lim.acquire("human"))
+        await asyncio.sleep(0.01)
+        assert not blocked.done()                  # 2 in flight is the cap
+        await lim.release_success(False, "human")
+        await asyncio.wait_for(blocked, 1.0)
+        await lim.release_success(False, "human")
+        await lim.release_success(False, "human")
+    asyncio.run(run())
+
+
+def test_adaptive_params_reclamp_a_learned_estimate():
+    async def run():
+        lim = make_adaptive_limiter()
+        await _rate_limit_at(lim, 40)              # estimate: 20
+        lim.set_adaptive_params(enabled=True, min_concurrent=4, max_concurrent=8)
+        assert lim.effective_max_concurrent == 8   # kept, clamped to the new ceiling
+    asyncio.run(run())

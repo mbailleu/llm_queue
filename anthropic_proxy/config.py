@@ -130,6 +130,27 @@ DEFAULT_CONFIG: dict[str, Any] = {
             ],
         },
     },
+    # --- Adaptive HIGH concurrency (AIMD) ---
+    # On HIGH, `max_concurrent` is an upper bound rather than a target: a
+    # tokens/minute limit is hit at a parallelism no config can predict, and
+    # demoting the whole tier on every 429 collapses throughput to LOW. With
+    # this enabled, a rate-limit on HIGH shrinks the concurrency estimate
+    # (multiplicative decrease from the concurrency observed at the 429) and
+    # keeps the tier; a run of saturated successes grows it back (additive
+    # increase), bounded by [high_adaptive_min_concurrent, the tier's
+    # max_concurrent]. LOW is never adapted.
+    "high_adaptive_concurrency": True,
+    "high_adaptive_min_concurrent": 4,      # never search below this
+    "high_adaptive_max_concurrent": None,   # extra ceiling (null = tiers.high.max_concurrent)
+    "high_adaptive_start_concurrent": None, # estimate on entering HIGH (null = the ceiling)
+    "high_adaptive_decrease_factor": 0.5,   # new = observed_at_429 * this
+    "high_adaptive_increase_step": 1,       # slots added per increase
+    "high_adaptive_increase_after": 20,     # saturated successes per increase
+    "high_adaptive_cooldown_seconds": 15.0, # quiet period after a decrease
+    # Once the estimate sits at high_adaptive_min_concurrent and upstream STILL
+    # rate-limits, fall back to the old HIGH->LOW demotion: pushback at
+    # LOW-level parallelism means the tier itself is wrong, not the concurrency.
+    "high_adaptive_demote_at_min": True,
     "promotion_cooldown_seconds": 300,
     "retry_max_attempts": 12,
     "retry_base_delay": 1.0,
@@ -354,6 +375,32 @@ def parse_switch_time(value: Any, now: float | None = None) -> float | None:
         return None
 
 
+def _opt_int(value: Any) -> int | None:
+    """A config value that may be null (meaning 'unset') as an int."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        log.warning(f"expected an integer or null, got {value!r}; ignored")
+        return None
+
+
+def apply_adaptive_config(limiter: Limiter, cfg: dict[str, Any]) -> None:
+    """Push the high_adaptive_* keys into the limiter (boot + hot-reload)."""
+    limiter.set_adaptive_params(
+        enabled=bool(cfg.get("high_adaptive_concurrency", True)),
+        min_concurrent=int(cfg.get("high_adaptive_min_concurrent", 4)),
+        max_concurrent=_opt_int(cfg.get("high_adaptive_max_concurrent")),
+        start_concurrent=_opt_int(cfg.get("high_adaptive_start_concurrent")),
+        decrease_factor=float(cfg.get("high_adaptive_decrease_factor", 0.5)),
+        increase_step=int(cfg.get("high_adaptive_increase_step", 1)),
+        increase_after=int(cfg.get("high_adaptive_increase_after", 20)),
+        cooldown_seconds=float(cfg.get("high_adaptive_cooldown_seconds", 15.0)),
+        demote_at_min=bool(cfg.get("high_adaptive_demote_at_min", True)),
+    )
+
+
 def build_state(config_path: Path | None = None) -> AppState:
     """Load config and build the whole application state (no I/O loops yet).
 
@@ -388,6 +435,7 @@ def build_state(config_path: Path | None = None) -> AppState:
         tokens_per_request=float(cfg.get("auto_assumed_tokens_per_request", 20000)),
         cost_per_request=float(cfg.get("auto_assumed_cost_per_request", 0.05)),
     )
+    apply_adaptive_config(limiter, cfg)
     limiter.set_daily_switch(parse_switch_time(cfg.get("scheduled_high_at")))
     limiter.set_daily_low_switch(parse_switch_time(cfg.get("scheduled_low_at")))
     pricing = cfg.get("model_pricing") or {}
@@ -448,6 +496,7 @@ async def apply_config_change(state: AppState, new_cfg: dict[str, Any]) -> None:
         tokens_per_request=float(new_cfg.get("auto_assumed_tokens_per_request", 20000)),
         cost_per_request=float(new_cfg.get("auto_assumed_cost_per_request", 0.05)),
     )
+    apply_adaptive_config(state.limiter, new_cfg)
     state.limiter.set_daily_switch(parse_switch_time(new_cfg.get("scheduled_high_at")))
     state.limiter.set_daily_low_switch(parse_switch_time(new_cfg.get("scheduled_low_at")))
     state.pacer.configure(new_cfg)
