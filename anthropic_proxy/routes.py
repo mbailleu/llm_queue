@@ -72,6 +72,19 @@ async def series_endpoint(req: Request):
     return _st(req).pstats.series(window)
 
 
+@router.get("/_proxy/gauges")
+async def gauges_endpoint(req: Request):
+    """Sampled history of how many requests are in the proxy right now.
+
+    Points carry `upstream` (holding a concurrency slot, i.e. at the API),
+    `queued`, `backoff` (sleeping out a 429) and `parked` (held by the pacer),
+    plus their sum as `total`. The gap between `total` and `upstream` is what
+    the proxy is holding back. In memory only — empty right after a restart,
+    covering `gauge_history_seconds` once warmed up.
+    """
+    return _st(req).gauges.series()
+
+
 @router.get("/_proxy/status")
 async def status_endpoint(req: Request):
     return _st(req).limiter.snapshot()

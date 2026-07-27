@@ -1446,6 +1446,14 @@ class Limiter:
         """Public read of the current rolling-window state (used by AutoPacer)."""
         return self._window_snapshot()
 
+    def gauge_counts(self) -> tuple[int, int, int]:
+        """(in_flight, queued, rate_limit_backoff) — the live queue gauges.
+
+        A bare counter read for the gauge sampler, which runs every couple of
+        seconds and has no use for the window/schedule math in `snapshot()`.
+        """
+        return self._in_flight, self._waiters, self._rl_waiting
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "active_tier": self._active.name,

@@ -132,3 +132,30 @@ def test_legacy_buckets_report_unknown_split(tmp_path):
     o = PersistentStats(path=str(path)).summary()["lifetime"]["overall"]
     assert o["avg_seconds"] == 4.0
     assert o["avg_upstream_seconds"] is None and o["avg_wait_seconds"] is None
+
+
+def test_series_carries_per_model_latency(tmp_path):
+    ps = PersistentStats(path=str(tmp_path / "stats.json"))
+    ps.record("fast", 200, 2.0, None, upstream=1.0)
+    ps.record("fast", 200, 4.0, None, upstream=3.0)
+    ps.record("slow", 200, 30.0, None, upstream=10.0)
+    s = ps.series("24h")
+    assert set(s["models"]) == {"fast", "slow"}
+    # Every model's series lines up with the shared x-axis points.
+    for pts in s["models"].values():
+        assert [p["t"] for p in pts] == [p["t"] for p in s["points"]]
+    last = {m: pts[-1] for m, pts in s["models"].items()}
+    assert last["fast"]["avg_seconds"] == 3.0
+    assert last["fast"]["avg_upstream_seconds"] == 2.0
+    assert last["slow"]["avg_seconds"] == 30.0
+    # Buckets where a model ran nothing are gaps, not zeroes.
+    assert all(p["avg_seconds"] is None for p in s["models"]["fast"][:-1])
+
+
+def test_series_keeps_only_the_busiest_models(tmp_path):
+    ps = PersistentStats(path=str(tmp_path / "stats.json"))
+    for i in range(5):
+        for _ in range(i + 1):
+            ps.record(f"m{i}", 200, 1.0, None, upstream=1.0)
+    s = ps.series("24h", model_limit=2)
+    assert set(s["models"]) == {"m4", "m3"}

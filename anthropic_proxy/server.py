@@ -93,6 +93,25 @@ async def persist_loop(state: AppState) -> None:
         await asyncio.sleep(5.0)
 
 
+async def gauge_loop(state: AppState) -> None:
+    """Sample the live queue gauges for the "requests in the system" graph.
+
+    A gauge has no completion event to record, so the only way to graph it is
+    to look at it on a timer. Cheap by construction: bare counter reads, no
+    window or snapshot math.
+    """
+    while True:
+        try:
+            in_flight, queued, backoff = state.limiter.gauge_counts()
+            state.gauges.sample(upstream=in_flight, queued=queued,
+                                backoff=backoff, parked=state.pacer.parked)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"gauges: sample error: {e!r}")
+        await asyncio.sleep(state.gauges.sample_seconds)
+
+
 async def startup(state: AppState) -> None:
     if state.client is not None:
         return
@@ -104,6 +123,7 @@ async def startup(state: AppState) -> None:
     )
     state.bg_tasks.append(asyncio.create_task(config_watch_loop(state)))
     state.bg_tasks.append(asyncio.create_task(persist_loop(state)))
+    state.bg_tasks.append(asyncio.create_task(gauge_loop(state)))
     human = f"http://{cfg['listen_host']}:{cfg['listen_port']}"
     auto_port = cfg.get("throttle_listen_port")
     auto = f" | auto-lane http://{cfg['listen_host']}:{auto_port}" if auto_port else ""

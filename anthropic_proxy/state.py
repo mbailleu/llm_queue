@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 from .calibrate import Calibrator
+from .gauges import GaugeHistory
 from .limiter import Limiter
 from .metrics import Metrics
 from .pacer import AutoPacer
@@ -30,6 +31,7 @@ class AppState:
     pstats: PersistentStats
     pacer: AutoPacer
     calibrator: Calibrator
+    gauges: GaugeHistory = field(default_factory=GaugeHistory)
     config_mtime: float = 0.0
     # Created in startup() / closed in shutdown(); shared by both lanes' ports.
     client: httpx.AsyncClient | None = None

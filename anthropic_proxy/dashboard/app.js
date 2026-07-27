@@ -52,13 +52,25 @@ function fmtUnits(metric, v, rounded) {
 const COLORS = {
   ok: "#3fb950", err: "#f85149",
   input: "#58a6ff", output: "#a371f7",
-  cache: "#d29922",
+  cache: "#d29922", total: "#58a6ff",
 };
+// Per-model line colors, assigned by the model's position in the sorted list
+// so a model keeps its color across polls.
+const MODEL_COLORS = [
+  "#58a6ff", "#3fb950", "#d29922", "#a371f7", "#f85149", "#39c5cf", "#db61a2", "#8b949e",
+];
 function fmtTime(t, step) {
   const d = new Date(t * 1000);
   const p = (n) => String(n).padStart(2, "0");
   if (step < 86400) return p(d.getHours()) + ":" + p(d.getMinutes());
   return (d.getMonth() + 1) + "/" + d.getDate();
+}
+function fmtClock(t) {
+  // Wall clock with seconds — the live gauge chart spans minutes, where the
+  // HH:MM labels of the hourly charts would all read the same.
+  const d = new Date(t * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
 }
 function setLegend(id, items) {
   document.getElementById(id).innerHTML = items
@@ -120,6 +132,57 @@ function drawChart(svgId, data, series, fmtVal) {
   }
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   svg.innerHTML = svgParts.join("");
+}
+// Line chart drawn as raw SVG, sharing drawChart's scales and gridlines.
+// `series` is a list of {label, color, dashed, values} where `values[i]` lines
+// up with `pts[i]` and may be null — a null breaks the line into segments
+// instead of dropping it to zero, which is what "this model ran nothing in
+// that bucket" should look like.
+function drawLines(svgId, pts, series, fmtVal, fmtX) {
+  const svg = document.getElementById(svgId);
+  const gridColor = getComputedStyle(document.documentElement)
+    .getPropertyValue("--grid").trim() || "#30363d";
+  const W = svg.clientWidth || svg.parentElement.clientWidth || 800;
+  const H = 150, padL = 46, padR = 8, padT = 8, padB = 16;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  let max = 0;
+  for (const s of series) for (const v of s.values) if (v != null && v > max) max = v;
+  max = max || 1;
+  const n = Math.max(1, pts.length - 1);
+  const x = (i) => padL + (pts.length === 1 ? plotW / 2 : (i / n) * plotW);
+  const y = (v) => padT + plotH - (v / max) * plotH;
+  const parts = [];
+  for (const frac of [0, 0.5, 1]) {
+    const yy = padT + plotH - frac * plotH;
+    parts.push(`<line x1="${padL}" y1="${yy}" x2="${W - padR}" y2="${yy}" stroke="${gridColor}" stroke-width="1"/>`);
+    parts.push(`<text x="${padL - 4}" y="${yy + 3}" text-anchor="end">${fmtVal(max * frac)}</text>`);
+  }
+  for (const s of series) {
+    let run = [];
+    const flush = () => {
+      if (run.length === 1) {
+        parts.push(`<circle cx="${run[0][0].toFixed(1)}" cy="${run[0][1].toFixed(1)}" r="1.6" fill="${s.color}"/>`);
+      } else if (run.length > 1) {
+        parts.push(
+          `<polyline points="${run.map(([px, py]) => px.toFixed(1) + "," + py.toFixed(1)).join(" ")}" ` +
+          `fill="none" stroke="${s.color}" stroke-width="1.5" stroke-linejoin="round"` +
+          (s.dashed ? ` stroke-dasharray="4 3"` : "") + `/>`
+        );
+      }
+      run = [];
+    };
+    s.values.forEach((v, i) => { if (v == null) flush(); else run.push([x(i), y(v)]); });
+    flush();
+  }
+  if (pts.length) {
+    const idxs = [0, Math.floor((pts.length - 1) / 2), pts.length - 1];
+    const anchors = ["start", "middle", "end"];
+    idxs.forEach((i, k) => {
+      parts.push(`<text x="${x(i).toFixed(1)}" y="${H - 4}" text-anchor="${anchors[k]}">${fmtX(pts[i].t)}</text>`);
+    });
+  }
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = parts.join("");
 }
 function row(stats) {
   const errClass = stats.errors > 0 ? "err" : "";
@@ -504,6 +567,46 @@ async function drawSeries() {
     setLegend("chart-tokens-legend", [
       { c: COLORS.input, l: "input" }, { c: COLORS.cache, l: "cache" }, { c: COLORS.output, l: "output" },
     ]);
+    // Latency per model: two lines per model over the same buckets — total
+    // (solid) and upstream-only (dashed). The distance between a model's two
+    // lines is the time its requests spent waiting inside the proxy.
+    const models = Object.keys(data.models || {}).sort();
+    const step = data.step;
+    const latSeries = [];
+    models.forEach((m, i) => {
+      const color = MODEL_COLORS[i % MODEL_COLORS.length];
+      const pts = data.models[m];
+      latSeries.push({ color, values: pts.map((p) => p.avg_seconds) });
+      latSeries.push({ color, dashed: true, values: pts.map((p) => p.avg_upstream_seconds) });
+    });
+    drawLines("chart-latency", data.points, latSeries, fmtDur, (t) => fmtTime(t, step));
+    setLegend("chart-latency-legend", models.map((m, i) => ({
+      c: MODEL_COLORS[i % MODEL_COLORS.length], l: m,
+    })));
+  } catch (e) { /* leave previous chart in place */ }
+}
+// Live "requests in the system": total (everything the proxy holds) vs. the
+// part actually at the upstream. The gap between the lines is the backlog —
+// queued for a slot, sleeping out a 429, or parked by the pacer.
+async function drawGauges() {
+  try {
+    const r = await fetch("/_proxy/gauges");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const data = await r.json();
+    const pts = data.points || [];
+    const el = document.getElementById("gauge-span");
+    el.textContent = pts.length
+      ? `${fmtSpan(pts[pts.length - 1].t - pts[0].t)} of ${data.step}s samples`
+      : "warming up…";
+    const span = pts.length ? pts[pts.length - 1].t - pts[0].t : 0;
+    drawLines("chart-gauge", pts, [
+      { color: COLORS.total, values: pts.map((p) => p.total) },
+      { color: COLORS.ok, values: pts.map((p) => p.upstream) },
+    ], (v) => Math.round(v).toString(), span < 900 ? fmtClock : (t) => fmtTime(t, 60));
+    setLegend("chart-gauge-legend", [
+      { c: COLORS.total, l: "total in proxy" },
+      { c: COLORS.ok, l: "at upstream" },
+    ]);
   } catch (e) { /* leave previous chart in place */ }
 }
 document.querySelectorAll("#series-controls button").forEach((b) => {
@@ -533,15 +636,16 @@ document.getElementById("theme-btn").addEventListener("click", () => {
   localStorage.setItem("theme", next);
   applyTheme(next);
   drawSeries();   // repaint SVG gridlines with the new theme's --grid color
+  drawGauges();
 });
 applyTheme(currentTheme());
 // Repaint charts when the OS theme flips while in Auto mode.
 if (window.matchMedia) {
   window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
-    if (currentTheme() === "auto") drawSeries();
+    if (currentTheme() === "auto") { drawSeries(); drawGauges(); }
   });
 }
-window.addEventListener("resize", drawSeries);
+window.addEventListener("resize", () => { drawSeries(); drawGauges(); });
 document.getElementById("boost-btn").addEventListener("click", async () => {
   const btn = document.getElementById("boost-btn");
   btn.disabled = true;
@@ -714,3 +818,7 @@ tick();
 setInterval(tick, 2000);
 drawSeries();
 setInterval(drawSeries, 15000);
+// The gauge history is sampled every couple of seconds server-side; redrawing
+// on the metrics cadence keeps the line moving without hammering the endpoint.
+drawGauges();
+setInterval(drawGauges, 4000);

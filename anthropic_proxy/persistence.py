@@ -297,11 +297,17 @@ class PersistentStats:
             }
         return out
 
-    def series(self, window: str) -> dict[str, Any]:
-        """Bucketed time series for graphing requests + tokens.
+    def series(self, window: str, model_limit: int = 8) -> dict[str, Any]:
+        """Bucketed time series for graphing requests + tokens + latency.
 
         24h / 7d use hourly buckets; 30d / lifetime roll up into daily buckets.
         Empty buckets are emitted so the x-axis is evenly spaced.
+
+        `models` adds a per-model latency series over the same buckets: average
+        total and average upstream seconds, `null` in buckets where that model
+        ran nothing (a gap in the line, not a zero). Only the `model_limit`
+        busiest models in the window are included, so a long tail of one-off
+        models can't turn the chart into spaghetti.
         """
         now = time.time()
         if window == "24h":
@@ -316,13 +322,18 @@ class PersistentStats:
         floor = int(now // step) * step
         start = floor - span + step
         bins: dict[int, dict[str, float]] = {}
+        # Same bucketing, kept per model, for the latency-per-model chart.
+        model_bins: dict[str, dict[int, dict[str, float]]] = {}
         earliest = now - span
         for hour, models in self._hours.items():
             if hour + HOUR_SECONDS <= earliest:
                 continue
-            b = bins.setdefault((hour // step) * step, _empty_counter())
-            for c in models.values():
+            bucket_t = (hour // step) * step
+            b = bins.setdefault(bucket_t, _empty_counter())
+            for model, c in models.items():
                 _add_counter(b, c)
+                _add_counter(model_bins.setdefault(model, {})
+                             .setdefault(bucket_t, _empty_counter()), c)
         points = []
         t = start
         while t <= floor:
@@ -337,7 +348,33 @@ class PersistentStats:
                 "cache_read_input_tokens": int(c["cache_read_input_tokens"]) if c else 0,
             })
             t += step
-        return {"window": window, "step": step, "points": points}
+        times = [p["t"] for p in points]
+        busiest = sorted(
+            model_bins,
+            key=lambda m: sum(b["count"] for b in model_bins[m].values()),
+            reverse=True,
+        )[:max(0, int(model_limit))]
+        models_out: dict[str, Any] = {}
+        for model in busiest:
+            buckets = model_bins[model]
+            series_points = []
+            for tt in times:
+                c = buckets.get(tt)
+                cnt = c["count"] if c else 0
+                ups = (c.get("upstream_sum", 0) or 0) if c else 0
+                series_points.append({
+                    "t": tt,
+                    "count": int(cnt),
+                    # null (not 0) where the model didn't run: the chart draws a
+                    # gap rather than a dive to zero.
+                    "avg_seconds": (c["duration_sum"] / cnt) if cnt else None,
+                    # Also null when the bucket predates upstream_sum, which is
+                    # indistinguishable from a real zero.
+                    "avg_upstream_seconds": (ups / cnt) if (cnt and ups > 0) else None,
+                })
+            models_out[model] = series_points
+        return {"window": window, "step": step, "points": points,
+                "models": models_out}
 
 
 # ---------- window.json (current rolling-window state) ----------

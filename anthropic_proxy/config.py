@@ -18,6 +18,7 @@ from typing import Any
 import yaml
 
 from .calibrate import Calibrator
+from .gauges import GaugeHistory
 from .limiter import BUDGET_METRICS, Budget, Limiter, Tier
 from .metrics import Metrics
 from .pacer import AutoPacer
@@ -177,6 +178,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "log_level": "INFO",
     "config_poll_seconds": 2.0,
     "metrics_window_seconds": 86400,
+    # Live "requests in the system" graph: how often the queue gauges (at
+    # upstream / queued / in 429 backoff / parked by the pacer) are sampled,
+    # and how much of that history is kept. In memory only — a restart starts a
+    # fresh history. 3600s of 2s samples is 1800 points, ~100 kB of JSON.
+    "gauge_sample_seconds": 2.0,
+    "gauge_history_seconds": 3600,
     "model_pricing": {},
     # Long-horizon persisted stats (weekly/monthly/lifetime + graphs).
     "stats_persist_path": "stats.json",
@@ -454,10 +461,14 @@ def build_state(config_path: Path | None = None) -> AppState:
     )
     pacer = AutoPacer(limiter, metrics, cfg)
     calibrator = Calibrator(str(cfg.get("calibration_persist_path", "calibration.json")))
+    gauges = GaugeHistory(
+        sample_seconds=float(cfg.get("gauge_sample_seconds", 2.0)),
+        history_seconds=float(cfg.get("gauge_history_seconds", 3600)),
+    )
     state = AppState(
         config=cfg, config_path=path, config_mtime=mtime,
         limiter=limiter, metrics=metrics, pstats=pstats, pacer=pacer,
-        calibrator=calibrator,
+        calibrator=calibrator, gauges=gauges,
     )
     limiter.load_window_state(load_window_file(state.window_persist_path()))
     return state
@@ -511,6 +522,10 @@ async def apply_config_change(state: AppState, new_cfg: dict[str, Any]) -> None:
     )
     state.calibrator.configure(
         str(new_cfg.get("calibration_persist_path", "calibration.json")))
+    state.gauges.configure(
+        sample_seconds=float(new_cfg.get("gauge_sample_seconds", 2.0)),
+        history_seconds=float(new_cfg.get("gauge_history_seconds", 3600)),
+    )
     state.config = new_cfg
     log.info(f"config reloaded from {state.config_path} (force_tier={forced})")
 

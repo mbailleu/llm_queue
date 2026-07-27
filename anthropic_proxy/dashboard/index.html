@@ -69,6 +69,22 @@
       <div class="chart-title">Tokens <span id="chart-tokens-legend" class="legend"></span></div>
       <svg id="chart-tokens" class="chart" preserveAspectRatio="none"></svg>
     </div>
+    <div class="chart-block">
+      <div class="chart-title">Latency per model · solid = total, dashed = upstream
+        <span id="chart-latency-legend" class="legend"></span></div>
+      <svg id="chart-latency" class="chart" preserveAspectRatio="none"></svg>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head">
+      <h2 style="margin:0">Requests in the system · live</h2>
+      <div class="chart-title" id="gauge-span"></div>
+    </div>
+    <div class="chart-block">
+      <div class="chart-title">In flight <span id="chart-gauge-legend" class="legend"></span></div>
+      <svg id="chart-gauge" class="chart" preserveAspectRatio="none"></svg>
+    </div>
   </div>
 
   <div class="panel">

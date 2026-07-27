@@ -144,6 +144,11 @@ class AutoPacer:
         self._free_passes_until = 0.0
         self.configure(cfg)
 
+    @property
+    def parked(self) -> int:
+        """Requests held in `gate()` right now (cheap read for the sampler)."""
+        return self._parked
+
     def release_all(self) -> int:
         """Let every currently parked automation request through, once.
 

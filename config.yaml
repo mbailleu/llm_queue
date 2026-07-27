@@ -261,6 +261,14 @@ log_level: "INFO"         # DEBUG | INFO | WARNING | ERROR
 # How often the proxy checks this config file for changes.
 config_poll_seconds: 2.0
 
+# Live "requests in the system" graph (dashboard, GET /_proxy/gauges). A gauge
+# has no completion event to record, so it is sampled on a timer: how many
+# requests are at the upstream (holding a concurrency slot) vs. queued, sleeping
+# out a 429, or parked by the pacer. Kept in memory only — a restart starts a
+# fresh history. 1h of 2s samples is 1800 points (~100 kB of JSON per poll).
+gauge_sample_seconds: 2.0
+gauge_history_seconds: 3600
+
 # Long-horizon statistics, persisted to disk so weekly/monthly/lifetime totals
 # and the dashboard graphs survive restarts. Completions are folded into hourly
 # per-model buckets (plus running lifetime totals) and written out on an

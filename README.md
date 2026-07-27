@@ -441,7 +441,8 @@ or set `force_tier: high` in `config.yaml` (picked up within ~2s).
 |---|---|---|
 | `/_proxy/`              | GET  | Web dashboard |
 | `/_proxy/metrics`        | GET  | All metrics as JSON (incl. `persistent` weekly/monthly/lifetime) |
-| `/_proxy/series`         | GET  | Bucketed time series for graphs (`?window=24h\|7d\|30d\|lifetime`) |
+| `/_proxy/series`         | GET  | Bucketed time series for graphs (`?window=24h\|7d\|30d\|lifetime`), incl. per-model latency |
+| `/_proxy/gauges`         | GET  | Sampled history of requests in the proxy (total vs. at upstream) |
 | `/_proxy/status`         | GET  | Limiter snapshot only |
 | `/_proxy/config`         | GET  | Currently-loaded config |
 | `/_proxy/statusline`     | GET  | One-line text status |
@@ -486,6 +487,17 @@ What's shown:
 - **Graphs.** Stacked-bar time series of requests (ok vs. errors) and tokens
   (input / cache / output), with a `24h / 7d / 30d / lifetime` window switch.
   24h and 7d are bucketed hourly; 30d and lifetime are bucketed daily.
+- **Latency per model.** One line chart, one color per model (the busiest 8),
+  two lines each: **solid = total**, **dashed = upstream**. The gap between a
+  model's two lines is the time its requests spent waiting inside the proxy.
+  Buckets where a model ran nothing are gaps, not zeroes. Same window switch as
+  the other graphs.
+- **Requests in the system (live).** Sampled every `gauge_sample_seconds` over
+  the last `gauge_history_seconds`: **total in proxy** vs. **at upstream**. The
+  distance between the two lines is the backlog — queued for a slot, sleeping
+  out a `429`, or parked by the pacer — so a flat green line under a rising blue
+  one is the proxy holding traffic, not the API being slow. In memory only, so
+  it starts empty after a restart.
 - **Per Model.** Two tables (latency + tokens) for every model that's been
   seen — keyed off the `model` field in request bodies.
 
@@ -687,6 +699,8 @@ and `listen_port` — those require a restart.
 | `log_level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. |
 | `config_poll_seconds` | `2.0` | How often `config.yaml` is checked. |
 | `metrics_window_seconds` | `86400` | Rolling-window cap for the completions deque. |
+| `gauge_sample_seconds` | `2.0` | How often the live "requests in the system" gauges are sampled. |
+| `gauge_history_seconds` | `3600` | How much of that sampled history is kept (in memory only). |
 | `model_pricing` | `{}` | Per-million-token rates. |
 | `stats_persist_path` | `stats.json` | File for persisted weekly/monthly/lifetime stats + graph history. |
 | `stats_flush_seconds` | `60.0` | Min seconds between disk writes (only when there's new data). |

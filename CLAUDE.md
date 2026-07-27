@@ -50,7 +50,7 @@ since they drift on every edit.
 ### `state.py` — AppState
 One dataclass holding everything the running proxy needs: `config`,
 `config_path`/`config_mtime`, `limiter`, `metrics`, `pstats`, `pacer`,
-`calibrator`, the
+`calibrator`, `gauges`, the
 shared httpx `client`, and `bg_tasks`. The FastAPI app stores it at
 `app.state.proxy`; routes and the proxy handler read it from there. There are
 **no module globals** — this is what makes every other module importable and
@@ -320,6 +320,16 @@ testable on its own.
   `POST /_proxy/calibrate/snapshot`, `GET /_proxy/calibrate/prices`,
   `POST /_proxy/calibrate/reset`.
 
+### `gauges.py` — live queue-gauge history (pure, no FastAPI)
+- `GaugeHistory`: a trailing deque of sampled counters for the dashboard's
+  "requests in the system" chart — `upstream` (holding a slot), `queued`,
+  `backoff` (in 429 retry sleep), `parked` (held by the pacer), and their sum
+  as `total`. A gauge has no completion event, so `server.gauge_loop` samples
+  it every `gauge_sample_seconds` (bare counter reads via
+  `limiter.gauge_counts()` + `pacer.parked` — deliberately not `snapshot()`,
+  which does window/schedule math). In memory only: `gauge_history_seconds` of
+  history, dropped on restart. `configure()` re-trims on config reload.
+
 ### `usage.py` — provider usage parsing (pure, no FastAPI)
 - `normalize_usage()`: maps the three provider usage wire formats to one
   canonical 4-field shape (input / output / cache_creation / cache_read).
@@ -360,7 +370,12 @@ testable on its own.
   - `summary()`: 24h / 7d / 30d / lifetime totals.
   - `lifetime_tokens()`: cumulative per-model token counters by class
     (model_pricing key names) — the proxy-side half of a calibration snapshot.
-  - `series()`: bucketed time series for the dashboard graphs.
+  - `series(window, model_limit=8)`: bucketed time series for the dashboard
+    graphs, plus a `models` map (per-model `avg_seconds` /
+    `avg_upstream_seconds` per bucket, aligned to the shared `points` x-axis)
+    for the latency-per-model chart. Buckets where a model ran nothing are
+    `null`, never 0 — the chart must draw a gap, not a dive to zero — and only
+    the busiest `model_limit` models are returned.
   - Cost is computed at read time from current pricing (re-pricing is
     retroactive); percentiles aren't kept long-term (only `duration_sum` → avg).
 - `load_window_file(path)` / `save_window_file(limiter, path)`: window.json
@@ -375,6 +390,8 @@ testable on its own.
   by the FastAPI `lifespan` (single-server) or directly by `serve()` (dual-port).
   This split is what lets the two ports share one client + one set of loops.
 - `persist_loop(state)`: flushes stats + window state every ~5s.
+- `gauge_loop(state)`: samples the live queue gauges into `state.gauges` every
+  `gauge_sample_seconds` (see `gauges.py`).
 - `compute_backoff(cfg, …)`: honors `Retry-After` (capped by remaining budget)
   else capped exponential backoff.
 - `request_lane(cfg, request)`: decides `"human"` vs `"auto"` from the **server
@@ -418,8 +435,9 @@ testable on its own.
 All endpoints read the `AppState` via `request.app.state.proxy`.
 - `GET /_proxy/` — dashboard (serves `dashboard/index.html`).
   `GET /_proxy/static/{styles.css,app.js}` — fixed allowlist, no traversal.
-- `GET /_proxy/metrics` — full JSON snapshot. `GET /_proxy/series` — graph data.
-  `GET /_proxy/status` — limiter snapshot.
+- `GET /_proxy/metrics` — full JSON snapshot. `GET /_proxy/series` — graph data
+  (incl. per-model latency). `GET /_proxy/gauges` — sampled requests-in-system
+  history. `GET /_proxy/status` — limiter snapshot.
 - `GET /_proxy/statusline` — compact `plain|tmux|ansi` status line.
 - `GET /_proxy/config` — effective config. `POST /_proxy/force_tier`,
   `POST /_proxy/boost` — runtime tier control. `POST /_proxy/schedule_high` /
@@ -448,7 +466,12 @@ All endpoints read the `AppState` via `request.app.state.proxy`.
 
 ### `dashboard/` — index.html, styles.css, app.js
 Self-contained vanilla HTML/CSS/JS, no build step. `app.js` polls
-`/_proxy/metrics` (2s) and `/_proxy/series` (15s) and draws SVG charts. The
+`/_proxy/metrics` (2s), `/_proxy/series` (15s) and `/_proxy/gauges` (4s), and
+draws SVG charts: `drawChart()` for stacked bars, `drawLines()` for the
+latency-per-model and requests-in-system charts (a `null` value **breaks** the
+polyline instead of plotting 0, which is what "no data in that bucket" must
+look like; per-model colors come from `MODEL_COLORS` indexed by sorted
+position, so a model keeps its color between polls). The
 files are read per request, so dashboard edits show up on browser reload
 without restarting the proxy. The state grid renders **one quota card per
 budget window** (from `limiter.window.windows`; a window's `group` is appended
@@ -519,8 +542,8 @@ Tests: `python -m pytest` (unit tests for the pure modules; no server needed).
 - **Two lanes, one shared state.** The lanes differ *only* in admission policy
   (`request_lane` → `pacer.gate()` for auto, `acquire(lane)` priority). Don't add
   per-lane upstream clients or windows — humans + auto share one quota window.
-- **Keep the module graph acyclic**: `usage`/`metrics`/`limiter`/`calibrate`
-  are leaves; `pacer` depends on `limiter` + `metrics`; `persistence` on `limiter` +
+- **Keep the module graph acyclic**: `usage`/`metrics`/`limiter`/`calibrate`/
+  `gauges` are leaves; `pacer` depends on `limiter` + `metrics`; `persistence` on `limiter` +
   `metrics`; `config` on all of those + `state`; `routes`/`server` at the top.
   No module reads globals — state is passed in (or read from
   `request.app.state.proxy` in routes).
