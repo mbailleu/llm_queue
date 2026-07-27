@@ -108,7 +108,9 @@ class AutoPacer:
     the reservation belongs to the long budgets. The final rate is the minimum
     across pacing budgets, additionally capped by physical throughput (the
     limiter's *effective* concurrency — the adaptive estimate while HIGH —
-    divided by the measured avg request time).
+    divided by the measured avg **upstream** time, i.e. how long a request
+    holds a concurrency slot; never the client-visible duration, which contains
+    time spent parked in this very gate).
 
     Every intermediate term of that arithmetic is kept, and `explain()` renders
     it as sentences (which budget binds, what each term contributed, why the
@@ -135,7 +137,47 @@ class AutoPacer:
         # dashboard/statusline can show traffic held back by pacing (it holds no
         # concurrency slot, so it is otherwise invisible to the limiter).
         self._parked = 0
+        # One-shot manual override (`release_all`): N free passes through the
+        # gate, expiring shortly after they were granted so leftovers can't be
+        # picked up by unrelated traffic minutes later.
+        self._free_passes = 0
+        self._free_passes_until = 0.0
         self.configure(cfg)
+
+    def release_all(self) -> int:
+        """Let every currently parked automation request through, once.
+
+        A manual override for "I know the budget is fine, go now": it grants one
+        free pass per request parked in `gate()` right now, without changing the
+        computed rate — the next arrivals are paced normally again. Sync and
+        await-free; parked requests pick their pass up on their next poll (they
+        are queued on `_lock`, so they drain one after another). Returns how many
+        passes were granted.
+        """
+        self._free_passes = self._parked
+        self._free_passes_until = time.monotonic() + max(10.0, self._poll * 5)
+        self._next = 0.0  # drop any pending schedule so they aren't held again
+        return self._free_passes
+
+    def _take_free_pass(self) -> bool:
+        """Consume one unexpired free pass, if any (see `release_all`)."""
+        if self._free_passes <= 0:
+            return False
+        if time.monotonic() >= self._free_passes_until:
+            self._free_passes = 0
+            return False
+        self._free_passes -= 1
+        return True
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Turn pacing on/off at runtime (the dashboard's throttle switch).
+
+        Disabling makes `gate()` a no-op, so the automation lane runs at the
+        same admission policy as the human one (still behind the concurrency
+        queue, still yielding to humans). Callers that want this to survive a
+        config reload should go through `apply_config_change` instead.
+        """
+        self._enabled = bool(enabled)
 
     def configure(self, cfg: dict[str, Any]) -> None:
         self._enabled = bool(cfg.get("auto_pacing_enabled", True))
@@ -281,10 +323,14 @@ class AutoPacer:
             entries.append(e)
             if e["binds"] and (binding is None or e["rate"] < entries[binding]["rate"]):
                 binding = len(entries) - 1
-        # Physical throughput ceiling: concurrency slots / avg request time.
-        # Kept in the result even when it isn't the minimum, so the explanation
-        # can show why it didn't bind.
-        avg = self._metrics.avg_duration(self._assumed)
+        # Physical throughput ceiling (Little's Law): concurrency slots / avg
+        # SERVICE time. It must be the slot-hold time, never the client-visible
+        # duration: that one includes time parked in this very gate, so using it
+        # would make pacing delay feed back into a lower cap, which delays
+        # pacing further — a spiral that a single request waiting out a 429
+        # backoff is enough to start. Kept in the result even when it isn't the
+        # minimum, so the explanation can show why it didn't bind.
+        avg = self._metrics.avg_upstream_time(self._assumed)
         capacity = max(1, self._limiter.effective_max_concurrent) / max(0.1, avg)
         out = {"windows": entries, "capacity": capacity, "avg_seconds": avg,
                "concurrency": max(1, self._limiter.effective_max_concurrent)}
@@ -409,7 +455,8 @@ class AutoPacer:
             lines += self._explain_window(b)
         lines.append(
             f"Throughput cap: {ev['concurrency']} concurrency slots ÷ "
-            f"{ev['avg_seconds']:.1f}s avg request = {_fmt_rate(ev['capacity'])}"
+            f"{ev['avg_seconds']:.1f}s avg upstream time (slot-hold only, "
+            f"excludes queueing and backoff) = {_fmt_rate(ev['capacity'])}"
             + ("." if binding is None or ev["capacity"] < entries[binding]["rate"]
                else " (not binding).")
         )
@@ -440,6 +487,8 @@ class AutoPacer:
         try:
             async with self._lock:
                 while True:
+                    if self._take_free_pass():
+                        return          # manual one-shot release
                     usable, rate = self._usable_and_rate()
                     if usable <= 0 or rate <= 0:
                         # Would eat into predicted human demand — park and
@@ -496,7 +545,7 @@ class AutoPacer:
                     "count_auto": round(count_auto, 2), "projected_auto": round(count_auto, 2),
                     "binding_index": None, "binding_metric": None,
                     "binding_window_seconds": None, "explain": self.explain(),
-                    "windows": []}
+                    "free_passes": 0, "windows": []}
         ev = self._evaluate()
         usable, rate = ev["usable"], ev["rate"]
         inf = rate == float("inf")
@@ -556,6 +605,7 @@ class AutoPacer:
             "count_auto": round(count_auto, 2),
             "projected_auto": round(projected_auto, 2),
             "binding_index": pace_binding,
+            "free_passes": self._free_passes,
             "binding_metric": binding_metric,
             "binding_window_seconds": binding_ws,
             "explain": self.explain(ev),

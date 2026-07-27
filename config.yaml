@@ -55,6 +55,10 @@ throttle_listen_port: 8788
 # file) must cover the models you use — unpriced models bill $0, so the cost
 # EWMA is 0 and cost budgets can neither fill nor bind. Use the ⚖ Calibrate
 # dashboard dialog / GET /_proxy/calibrate/prices to derive prices.
+# Master switch for automation-lane pacing. The dashboard's 🐢/🐇 button and
+# POST /_proxy/pacer/enabled flip this same key at runtime (an edit here wins
+# over them). POST /_proxy/pacer/release is the one-shot "let what's parked
+# right now through" override, which leaves the computed rate alone.
 auto_pacing_enabled: true
 human_demand_safety: 1.5            # >1 leaves more headroom for humans (slower auto)
 human_demand_horizon_seconds: 3600  # window over which the human request rate is measured
@@ -72,7 +76,13 @@ auto_pace_min_window_seconds: 300     # windows SHORTER than this don't pace aut
                                       # the long budgets. 0 = pace on every window (old behavior).
 human_quota_floor: 0                # hard floor of requests always kept free for humans (0 = purely statistical)
 auto_concurrency_reserve: 0         # slots reserved for humans (auto capped at max_concurrent - this; 0 = rely on priority)
-auto_assumed_request_seconds: 30.0  # avg request time assumed before any latency is measured
+auto_assumed_request_seconds: 30.0  # avg UPSTREAM time assumed before any is measured. The
+                                    # throughput cap is concurrency / upstream time, where
+                                    # "upstream time" is only how long a request holds a slot —
+                                    # time parked in the pacer, queued, or sleeping out a 429 is
+                                    # excluded on purpose (counting it would let pacing delay
+                                    # feed back into an ever-lower rate). The dashboard shows
+                                    # the two halves side by side as "upstream" and "wait".
 auto_assumed_tokens_per_request: 20000  # tokens per request assumed before any completion is measured
 auto_assumed_cost_per_request: 0.05     # USD per request assumed before any completion is measured
 auto_poll_seconds: 1.0              # how often a parked/over-pace auto request re-checks

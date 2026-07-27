@@ -384,3 +384,69 @@ def test_capacity_cap_uses_the_effective_concurrency():
     lim.note_request("m", "human")
     _, rate = pacer._usable_and_rate()
     assert rate <= 10.0 / 1.0 + 1e-9       # 10 slots / 1s assumed avg
+
+
+# ---- manual controls: one-shot release + the throttle switch ----
+
+def test_release_all_frees_everything_parked_once():
+    lim, pacer = make_setup(window_seconds=600, window_limit=1)
+    lim.note_request("m", "human")     # budget spent -> auto parks
+
+    async def run():
+        tasks = [asyncio.create_task(pacer.gate()) for _ in range(3)]
+        await asyncio.sleep(0.15)
+        assert pacer.status()["parked"] == 3
+        assert pacer.release_all() == 3
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0)
+        assert pacer.status()["parked"] == 0
+        # One-shot: the next request is paced (parked) again.
+        nxt = asyncio.create_task(pacer.gate())
+        await asyncio.sleep(0.15)
+        assert not nxt.done() and pacer.status()["parked"] == 1
+        nxt.cancel()
+    asyncio.run(run())
+
+
+def test_release_all_with_nothing_parked_grants_nothing():
+    lim, pacer = make_setup(window_seconds=600, window_limit=1)
+    lim.note_request("m", "human")
+    assert pacer.release_all() == 0
+
+    async def run():
+        task = asyncio.create_task(pacer.gate())
+        await asyncio.sleep(0.15)
+        assert not task.done()         # no stale free pass to pick up
+        task.cancel()
+    asyncio.run(run())
+
+
+def test_free_passes_expire():
+    lim, pacer = make_setup(window_seconds=600, window_limit=1)
+    lim.note_request("m", "human")
+
+    async def run():
+        parked = asyncio.create_task(pacer.gate())
+        await asyncio.sleep(0.15)
+        pacer.release_all()
+        pacer._free_passes_until = time.monotonic() - 1.0   # pretend time passed
+        await asyncio.sleep(0.15)
+        assert not parked.done()       # expired pass isn't honored
+        parked.cancel()
+    asyncio.run(run())
+
+
+def test_set_enabled_switches_throttling_off_and_on():
+    lim, pacer = make_setup(window_seconds=600, window_limit=1)
+    lim.note_request("m", "human")     # spent: pacing would park auto
+
+    async def run():
+        pacer.set_enabled(False)
+        await asyncio.wait_for(pacer.gate(), timeout=0.5)   # straight through
+        assert pacer.status()["enabled"] is False
+        assert pacer.status()["reason"] == "disabled"
+        pacer.set_enabled(True)
+        task = asyncio.create_task(pacer.gate())
+        await asyncio.sleep(0.15)
+        assert not task.done()                              # parked again
+        task.cancel()
+    asyncio.run(run())

@@ -167,10 +167,11 @@ rate   = min(rate over all budgets, free_slots / avg_request_time)  # never outr
 - If humans have already spent **any** budget down to that prediction,
   `usable ≤ 0` and automation **parks** until the window advances or resets.
   The dashboard's Auto Pacing card names the budget that currently binds.
-- `avg_request_time` (the tracked EWMA latency) and the concurrency cap in force
-  set the physical ceiling, so the pacer never schedules faster than requests
-  can actually drain. In the low tier that's `max_concurrent` (4) slots; on HIGH
-  it's the [adaptive estimate](#adaptive-high-concurrency).
+- `avg_upstream_time` and the concurrency cap in force set the physical ceiling,
+  so the pacer never schedules faster than requests can actually drain. In the
+  low tier that's `max_concurrent` (4) slots; on HIGH it's the
+  [adaptive estimate](#adaptive-high-concurrency). **This is slot-hold time, not
+  the client-visible duration** — see [Upstream vs. wait](#upstream-vs-wait).
 - Budgets shorter than `auto_pace_min_window_seconds` (default 300s) are
   **exempt**: a per-minute limit self-heals in ≤60s, so it never sets the rate
   and never parks automation — the queue and the 429 backoff throttle it
@@ -197,6 +198,38 @@ from `GET /_proxy/metrics`. When the *reserve alone* is what parks automation,
 the explanation says so and names the two knobs that loosen it
 (`human_demand_safety`, `human_demand_lookahead_seconds`) — a long window plus a
 busy human lane can reserve more than the whole budget.
+
+Two manual overrides sit in the dashboard header:
+
+- **⏭ Release all** (`POST /_proxy/pacer/release`) hands a free pass to every
+  request parked in the gate *right now*. The computed rate is untouched, so the
+  next arrivals are paced normally again — it drains a backlog when you know the
+  budget is fine, without turning pacing off.
+- **🐢 Throttled / 🐇 Unthrottled** (`POST /_proxy/pacer/enabled`) is the
+  on/off switch. Off makes the gate a no-op: automation is admitted like human
+  traffic (still behind the concurrency queue, still yielding to humans). It
+  writes the same `auto_pacing_enabled` the config file uses, so a later edit of
+  `config.yaml` wins over it.
+
+### Upstream vs. wait
+
+Every request's latency is recorded as two halves:
+
+- **upstream** — time it actually held a concurrency slot: the upstream call
+  plus streaming the body back.
+- **wait** — everything else the proxy added: parked in the pacer gate, queued
+  for a slot, and sleeping out `429` backoff.
+
+The dashboard shows both (throughput cards, and `Upstream` / `Wait` columns in
+the latency tables); `avg_seconds` / `p50` / `p95` stay the *total*, which is
+what your client experienced.
+
+The split isn't cosmetic — **the pacer's throughput cap must use the upstream
+half.** A request parked for two hours would otherwise report a two-hour
+"latency", which feeds `concurrency / avg_time`, which lowers the admission
+rate, which parks the next request even longer. One `429` that sleeps out a
+quota window is enough to start that spiral, and the EWMA needs a dozen normal
+requests to recover from each such sample.
 
 Real-time spikes are covered separately: automation never occupies a reserved
 slot (`auto_concurrency_reserve`, default 0) and always yields freed slots to
@@ -414,6 +447,8 @@ or set `force_tier: high` in `config.yaml` (picked up within ~2s).
 | `/_proxy/statusline`     | GET  | One-line text status |
 | `/_proxy/force_tier`     | POST | Pin a tier: `{"tier": "low" \| "high" \| null}` |
 | `/_proxy/boost`          | POST | Jump to HIGH temporarily; auto-demotes on the next rate-limit |
+| `/_proxy/pacer/release`  | POST | Let everything the pacer is holding through, once (no body) |
+| `/_proxy/pacer/enabled`  | POST | Throttle switch: `{"enabled": true \| false}`, or no body to toggle |
 | `/_proxy/window/count`   | POST | Set the active quota window's count: `{"count": N}` |
 | `/_proxy/window/start`   | POST | Set/clear the window start time: `{"started_at": <unix s> \| null}` |
 | any other path           | any  | Forwarded to `upstream_base_url` |
@@ -429,6 +464,9 @@ What's shown:
   per rolling **quota budget** (`X / N` in that budget's units, time elapsed /
   left, per-lane spend and projections), and lifetime counters (rate-limited,
   promotions, demotions, probes).
+- **Latency, split.** Throughput cards and the latency tables show `Upstream`
+  (slot-hold) next to `Wait` (pacing + queue + `429` backoff) alongside the
+  total — see [Upstream vs. wait](#upstream-vs-wait).
 - **Hover for the math.** Cards with a `?` cursor carry the full derivation of
   the number they show: Auto Pacing explains the current rate term by term, each
   quota card explains its own budget, and In Flight explains the adaptive
@@ -456,6 +494,9 @@ Header controls:
   *Auto* follows your OS `prefers-color-scheme` and flips live when the OS does.
 - **⚡ Boost HIGH** temporarily promotes to HIGH (`POST /_proxy/boost`); it
   auto-demotes on the first rate-limit. Disabled while a `force_tier` is pinned.
+- **⏭ Release all** frees everything the pacer is currently holding, once. It
+  shows the count (`⏭ Release 3`) and is disabled when nothing is parked.
+- **🐢 Throttled / 🐇 Unthrottled** switches automation-lane pacing off and on.
 
 ## Statusline integration
 
@@ -614,7 +655,7 @@ and `listen_port` — those require a restart.
 | `auto_pace_min_window_seconds` | `300` | Budgets shorter than this don't pace automation at all (never bind, never park). |
 | `human_quota_floor` | `0` | Hard floor of requests always kept free for humans (0 = purely statistical). |
 | `auto_concurrency_reserve` | `0` | Concurrency slots reserved for humans (auto capped at `max_concurrent −` this). |
-| `auto_assumed_request_seconds` | `30.0` | Assumed request time before latency is measured. |
+| `auto_assumed_request_seconds` | `30.0` | Assumed **upstream** (slot-hold) time before any is measured. |
 | `auto_assumed_tokens_per_request` | `20000` | Assumed tokens/request before any completion is measured (token-budget pacing). |
 | `auto_assumed_cost_per_request` | `0.05` | Assumed USD/request before any completion is measured (cost-budget pacing). |
 | `auto_poll_seconds` | `1.0` | How often a parked/over-pace auto request re-checks. |
@@ -696,6 +737,18 @@ curl -X POST http://127.0.0.1:8787/_proxy/force_tier \
 
 # Temporarily jump to HIGH (auto-demotes on the next rate-limit)
 curl -X POST http://127.0.0.1:8787/_proxy/boost
+
+# Let everything the pacer is holding through, once (rate stays as it was)
+curl -X POST http://127.0.0.1:8787/_proxy/pacer/release
+
+# Throttle switch: off / on / toggle
+curl -X POST http://127.0.0.1:8787/_proxy/pacer/enabled \
+     -H 'content-type: application/json' -d '{"enabled":false}'
+curl -X POST http://127.0.0.1:8787/_proxy/pacer/enabled
+
+# How much of your latency is the proxy holding traffic back?
+curl -s http://127.0.0.1:8787/_proxy/metrics \
+  | jq '.overall."1h" | {avg_seconds, avg_upstream_seconds, avg_wait_seconds}'
 
 # Sync the quota-window indicator with what upstream has actually used
 curl -X POST http://127.0.0.1:8787/_proxy/window/count \

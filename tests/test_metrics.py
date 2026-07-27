@@ -68,3 +68,43 @@ def test_old_completions_age_out():
     m.request_finished("m", t, 200)
     time.sleep(0.08)
     assert m.summary()["overall"]["1m"]["count"] == 0
+
+
+# ---- upstream (slot-hold) vs. in-proxy wait ----
+
+def test_upstream_and_wait_split_reported():
+    m = Metrics()
+    t = time.time() - 10.0                      # 10s total, 2s of it upstream
+    m.request_finished("m", t, 200, None, upstream_seconds=2.0)
+    o = m.summary()["overall"]["1m"]
+    assert 9.5 < o["avg_seconds"] < 10.5
+    assert 1.9 < o["avg_upstream_seconds"] < 2.1
+    assert 7.5 < o["avg_wait_seconds"] < 8.5    # the rest was queue/pacing/backoff
+    assert o["avg_upstream_seconds"] + o["avg_wait_seconds"] == o["avg_seconds"]
+
+
+def test_avg_upstream_time_is_what_pacing_should_use():
+    m = Metrics()
+    assert m.avg_upstream_time(30.0) == 30.0    # fallback before any data
+    t = time.time() - 600.0                     # 10min parked, 5s upstream
+    m.request_finished("m", t, 200, None, upstream_seconds=5.0)
+    assert 4.0 < m.avg_upstream_time(30.0) < 6.0
+    assert m.avg_duration(30.0) > 500.0         # total still tells the truth
+
+
+def test_unmeasured_upstream_falls_back_to_total():
+    m = Metrics()
+    t = time.time() - 3.0
+    m.request_finished("m", t, 200)             # no upstream_seconds given
+    o = m.summary()["overall"]["1m"]
+    assert o["avg_upstream_seconds"] == o["avg_seconds"]
+    assert o["avg_wait_seconds"] == 0.0
+
+
+def test_upstream_clamped_to_the_total():
+    m = Metrics()
+    t = time.time() - 1.0
+    m.request_finished("m", t, 200, None, upstream_seconds=99.0)  # bogus/clock skew
+    o = m.summary()["overall"]["1m"]
+    assert o["avg_upstream_seconds"] <= o["avg_seconds"]
+    assert o["avg_wait_seconds"] >= 0.0

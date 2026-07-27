@@ -241,6 +241,50 @@ async def boost_endpoint(req: Request):
     return st.limiter.snapshot()
 
 
+@router.post("/_proxy/pacer/release")
+async def pacer_release_endpoint(req: Request):
+    """Release every automation request currently parked by the pacer, once.
+
+    A one-shot override: each request parked in the gate right now gets a free
+    pass, the computed rate is untouched, and the next arrivals are paced
+    normally again. Use it when you know the remaining budget is fine and just
+    want the backlog to go. Returns how many passes were granted.
+      curl -X POST localhost:8787/_proxy/pacer/release
+    """
+    st = _st(req)
+    return {"released": st.pacer.release_all(), "pacer": st.pacer.status()}
+
+
+@router.post("/_proxy/pacer/enabled")
+async def pacer_enabled_endpoint(req: Request):
+    """Turn automation-lane throttling on or off (the dashboard's switch).
+
+    Body: {"enabled": true|false}, or omit it to toggle. Off makes the gate a
+    no-op — automation is then admitted like human traffic (still behind the
+    concurrency queue, still yielding to humans), which is the "no throttle"
+    position. This goes through the live config, so it is exactly equivalent to
+    editing `auto_pacing_enabled` in config.yaml — and a later edit of that file
+    wins over it.
+      curl -X POST localhost:8787/_proxy/pacer/enabled -d '{"enabled": false}'
+    """
+    st = _st(req)
+    try:
+        body = await req.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    if "enabled" in body:
+        enabled = body["enabled"]
+        if not isinstance(enabled, bool):
+            return JSONResponse({"error": "'enabled' must be true or false"},
+                                status_code=400)
+    else:
+        enabled = not bool(st.config.get("auto_pacing_enabled", True))
+    await apply_config_change(st, {**st.config, "auto_pacing_enabled": enabled})
+    return {"enabled": enabled, "pacer": st.pacer.status()}
+
+
 async def _set_oneshot_switch(req: Request, direction: str):
     """Shared body parsing/validation for the two one-shot schedule endpoints."""
     st = _st(req)

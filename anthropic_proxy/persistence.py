@@ -27,11 +27,14 @@ MONTH_SECONDS = 30 * 86400
 # Aggregated per-bucket counters. Percentiles can't be merged across buckets, so
 # long-term we keep duration_sum (-> average) only; cost is derived at read time
 # from current pricing rather than stored, so re-pricing applies retroactively.
+# `upstream_sum` is the slot-hold half of duration_sum (see Metrics): buckets
+# written before it existed simply have 0, which reads back as "not measured"
+# rather than as a real zero.
 _COUNTER_KEYS = (
     "count", "success", "errors",
     "input_tokens", "output_tokens",
     "cache_creation_input_tokens", "cache_read_input_tokens",
-    "duration_sum",
+    "duration_sum", "upstream_sum",
 )
 
 
@@ -155,7 +158,7 @@ class PersistentStats:
     # -- recording --
 
     def record(self, model: str, status: int, duration: float,
-               usage: dict | None) -> None:
+               usage: dict | None, upstream: float | None = None) -> None:
         now = time.time()
         hour = int(now // HOUR_SECONDS) * HOUR_SECONDS
         u = usage or {}
@@ -175,6 +178,7 @@ class PersistentStats:
             store["cache_creation_input_tokens"] += cc_t
             store["cache_read_input_tokens"] += cr_t
             store["duration_sum"] += duration
+            store["upstream_sum"] += duration if upstream is None else upstream
         self._dirty = True
 
     # -- read models --
@@ -209,6 +213,23 @@ class PersistentStats:
                 _add_counter(agg.setdefault(model, _empty_counter()), c)
         return agg
 
+    @staticmethod
+    def _avg_split(c: dict[str, float]) -> dict[str, float | None]:
+        """Average upstream / wait seconds, or None when nothing measured them.
+
+        Buckets written before `upstream_sum` existed have a 0 sum; reporting
+        that as "0s upstream, all wait" would be a lie, so it comes back as
+        unknown instead.
+        """
+        cnt = c["count"]
+        ups = c.get("upstream_sum", 0) or 0
+        if not cnt or ups <= 0:
+            return {"avg_upstream_seconds": None, "avg_wait_seconds": None}
+        return {
+            "avg_upstream_seconds": ups / cnt,
+            "avg_wait_seconds": max(0.0, c["duration_sum"] - ups) / cnt,
+        }
+
     def _format_model(self, model: str, c: dict[str, float]) -> dict[str, Any]:
         cnt = c["count"]
         return {
@@ -216,6 +237,7 @@ class PersistentStats:
             "success": int(c["success"]),
             "errors": int(c["errors"]),
             "avg_seconds": (c["duration_sum"] / cnt) if cnt else None,
+            **self._avg_split(c),
             "input_tokens": int(c["input_tokens"]),
             "output_tokens": int(c["output_tokens"]),
             "cache_creation_input_tokens": int(c["cache_creation_input_tokens"]),
@@ -250,6 +272,7 @@ class PersistentStats:
             "success": int(total["success"]),
             "errors": int(total["errors"]),
             "avg_seconds": (total["duration_sum"] / cnt) if cnt else None,
+            **self._avg_split(total),
             "input_tokens": int(total["input_tokens"]),
             "output_tokens": int(total["output_tokens"]),
             "cache_creation_input_tokens": int(total["cache_creation_input_tokens"]),

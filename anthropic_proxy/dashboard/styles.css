@@ -117,14 +117,19 @@ th {
 .empty { color: var(--muted); font-style: italic; text-align: center; padding: 12px; }
 .err { color: var(--red); }
 .ok { color: var(--green); }
-#boost-btn, #theme-btn, #calibrate-btn {
+#boost-btn, #theme-btn, #calibrate-btn, #release-btn, #throttle-btn {
   background: var(--panel); color: var(--text);
   border: 1px solid var(--border); border-radius: 6px;
   padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
 }
 #boost-btn:hover:not(:disabled) { border-color: var(--green); color: var(--green); }
-#boost-btn:disabled { opacity: 0.5; cursor: default; }
+#boost-btn:disabled, #release-btn:disabled { opacity: 0.5; cursor: default; }
 #theme-btn:hover, #calibrate-btn:hover { border-color: var(--accent); color: var(--accent); }
+#release-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+/* The throttle switch shows its state, not the action: yellow = pacing on
+   (automation is being held back), red = off (automation runs unthrottled). */
+#throttle-btn.on { border-color: var(--yellow); color: var(--yellow); }
+#throttle-btn.off { border-color: var(--red); color: var(--red); }
 
 /* ---- price-calibration dialog ---- */
 #calibrate-dialog {

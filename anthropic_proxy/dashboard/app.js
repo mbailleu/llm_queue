@@ -123,6 +123,8 @@ function drawChart(svgId, data, series, fmtVal) {
 }
 function row(stats) {
   const errClass = stats.errors > 0 ? "err" : "";
+  // Total = what the caller waited. Upstream = time actually spent holding a
+  // concurrency slot; Wait = the rest (pacer parking, queueing, 429 backoff).
   return `
     <td>${stats.count}</td>
     <td class="ok">${stats.success ?? 0}</td>
@@ -130,6 +132,8 @@ function row(stats) {
     <td>${fmtDur(stats.avg_seconds)}</td>
     <td>${fmtDur(stats.p50_seconds)}</td>
     <td>${fmtDur(stats.p95_seconds)}</td>
+    <td>${fmtDur(stats.avg_upstream_seconds)}</td>
+    <td class="${(stats.avg_wait_seconds || 0) > (stats.avg_upstream_seconds || 0) ? "warn" : ""}">${fmtDur(stats.avg_wait_seconds)}</td>
   `;
 }
 function tokenRow(stats) {
@@ -142,7 +146,9 @@ function tokenRow(stats) {
   `;
 }
 function renderWindowTable(data) {
-  let html = "<tr><th>Window</th><th>Count</th><th>OK</th><th>Err</th><th>Avg</th><th>p50</th><th>p95</th></tr>";
+  let html = "<tr><th>Window</th><th>Count</th><th>OK</th><th>Err</th><th>Avg</th><th>p50</th><th>p95</th>"
+    + '<th title="Average time actually spent on the upstream call (holding a concurrency slot)">Upstream</th>'
+    + '<th title="Average time spent waiting inside the proxy: pacer parking, concurrency queue, 429 backoff">Wait</th></tr>';
   for (const w of WINDOWS) {
     const s = data[w] || {count:0, success:0, errors:0, avg_seconds:null, p50_seconds:null, p95_seconds:null};
     html += `<tr><td>${w}</td>${row(s)}</tr>`;
@@ -254,6 +260,15 @@ async function tick() {
     }
     // Hovering the card shows the whole derivation of the current rate (which
     // budget binds, every term of its arithmetic, why the others don't count).
+    // Throttle switch shows the current state; Release is only meaningful while
+    // the pacer is actually holding something.
+    const throttleBtn = document.getElementById("throttle-btn");
+    throttleBtn.textContent = P.enabled ? "🐢 Throttled" : "🐇 Unthrottled";
+    throttleBtn.classList.toggle("on", !!P.enabled);
+    throttleBtn.classList.toggle("off", !P.enabled);
+    const releaseBtn = document.getElementById("release-btn");
+    releaseBtn.disabled = !(P.parked > 0);
+    releaseBtn.textContent = P.parked > 0 ? `⏭ Release ${P.parked}` : "⏭ Release all";
     const paceCard = `
       <div class="stat has-why" title="${esc((P.explain || []).join("\n"))}">
         <div class="label">Auto Pacing</div>
@@ -392,11 +407,17 @@ async function tick() {
       const errBadge = s.errors > 0 ? ` <span class="err">(${s.errors} err)</span>` : "";
       const costBadge = s.cost !== null && s.cost !== undefined ? ` · ${fmtCost(s.cost)}` : "";
       const tokSub = `${fmtNum(s.input_tokens + (s.cache_creation_input_tokens||0) + (s.cache_read_input_tokens||0))} in / ${fmtNum(s.output_tokens)} out`;
+      // Split the average into upstream vs. in-proxy wait — a big wait share is
+      // the pacer/queue holding traffic, not a slow upstream.
+      const waitSub = s.avg_upstream_seconds != null
+        ? `${fmtDur(s.avg_upstream_seconds)} upstream · ${fmtDur(s.avg_wait_seconds)} wait`
+        : "";
       tpHtml += `
         <div class="stat">
           <div class="label">Last ${w}</div>
           <div class="value">${s.count}</div>
           <div class="sub">${fmtDur(s.avg_seconds)} avg${errBadge}${costBadge}</div>
+          ${waitSub ? `<div class="sub">${waitSub}</div>` : ""}
           <div class="sub">${tokSub}</div>
         </div>
       `;
@@ -414,12 +435,16 @@ async function tick() {
         const inTot = o.input_tokens + (o.cache_creation_input_tokens||0) + (o.cache_read_input_tokens||0);
         const errBadge = o.errors > 0 ? ` <span class="err">(${o.errors} err)</span>` : "";
         const costBadge = o.cost !== null && o.cost !== undefined ? ` · ${fmtCost(o.cost)}` : "";
+        const upSub = o.avg_upstream_seconds != null
+          ? `<div class="sub">${fmtDur(o.avg_upstream_seconds)} upstream · ${fmtDur(o.avg_wait_seconds)} wait</div>`
+          : "";
         totHtml += `
           <div class="stat">
             <div class="label">${label}</div>
             <div class="value">${fmtNum(o.count)}</div>
             <div class="sub">${fmtNum(inTot)} in / ${fmtNum(o.output_tokens)} out</div>
             <div class="sub">${fmtDur(o.avg_seconds)} avg${errBadge}${costBadge}</div>
+            ${upSub}
           </div>
         `;
       }
@@ -529,6 +554,42 @@ document.getElementById("boost-btn").addEventListener("click", async () => {
   } catch (e) {
     alert("boost failed: " + e.message);
   }
+  tick();
+});
+// ---- Pacer controls: one-shot release of everything parked, and the
+// throttle on/off switch (POSTs the same auto_pacing_enabled the config uses).
+async function postJSON(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({}));
+    throw new Error(e.error || "HTTP " + r.status);
+  }
+  return r.json();
+}
+document.getElementById("release-btn").addEventListener("click", async (ev) => {
+  const btn = ev.currentTarget;
+  btn.disabled = true;
+  try {
+    const res = await postJSON("/_proxy/pacer/release");
+    btn.textContent = `⏭ Released ${res.released}`;
+  } catch (e) {
+    alert("release failed: " + e.message);
+  }
+  tick();
+});
+document.getElementById("throttle-btn").addEventListener("click", async (ev) => {
+  const btn = ev.currentTarget;
+  btn.disabled = true;
+  try {
+    await postJSON("/_proxy/pacer/enabled", { enabled: btn.classList.contains("off") });
+  } catch (e) {
+    alert("throttle switch failed: " + e.message);
+  }
+  btn.disabled = false;
   tick();
 });
 // ---- Price-calibration dialog: record the provider's cumulative cost

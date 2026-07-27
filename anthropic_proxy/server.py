@@ -155,6 +155,19 @@ async def handle_proxy(state: AppState, full_path: str, request: Request):
 
     finished = False
     handed_off = False
+    # Time this request actually held a concurrency slot, summed over attempts.
+    # `started_at` above is the client's clock and deliberately starts before
+    # pacing and queueing; this one only runs between `acquire()` returning and
+    # the matching `release_*`, so pacer parking, queue waiting and 429 backoff
+    # (all of which happen with no slot held) are excluded by construction.
+    # That makes it the request's service time — the input the pacer's
+    # throughput cap needs, and the "upstream" half of the dashboard's latency
+    # split. Retries are summed because every attempt occupies the pipe.
+    upstream_seconds = 0.0
+
+    def note_slot_released(slot_started: float) -> None:
+        nonlocal upstream_seconds
+        upstream_seconds += max(0.0, time.monotonic() - slot_started)
 
     def finalize(status: int, usage: dict | None = None) -> None:
         nonlocal finished
@@ -176,7 +189,8 @@ async def handle_proxy(state: AppState, full_path: str, request: Request):
                 limiter.note_usage(tokens, cost, lane)
             # Always drop it from the in-flight tally (any outcome ends its life).
             limiter.note_done(noted_weight, lane)
-            metrics.request_finished(model, started_at, status, usage)
+            metrics.request_finished(model, started_at, status, usage,
+                                     upstream_seconds)
 
     try:
         # Connection errors give up after retry_max_attempts (a down upstream
@@ -191,6 +205,7 @@ async def handle_proxy(state: AppState, full_path: str, request: Request):
         while True:
             attempt += 1
             was_probe = await limiter.acquire(lane)
+            slot_started = time.monotonic()   # the slot is now held
             try:
                 outbound = state.client.build_request(
                     method=request.method, url=target,
@@ -198,6 +213,7 @@ async def handle_proxy(state: AppState, full_path: str, request: Request):
                 )
                 response = await state.client.send(outbound, stream=True)
             except httpx.HTTPError as e:
+                note_slot_released(slot_started)
                 await limiter.release_other_error(was_probe, lane)
                 conn_errors += 1
                 log.warning(
@@ -220,6 +236,7 @@ async def handle_proxy(state: AppState, full_path: str, request: Request):
                     rl_body = await response.aread()
                 finally:
                     await response.aclose()
+                note_slot_released(slot_started)
                 await limiter.release_rate_limited(was_probe, lane)
                 remaining = deadline - time.monotonic()
                 backoff = compute_backoff(
@@ -276,6 +293,9 @@ async def handle_proxy(state: AppState, full_path: str, request: Request):
                         await response.aclose()
                     except Exception:
                         pass
+                    # The slot is held for the whole stream — the response body
+                    # occupies the pipe until the client has drained it.
+                    note_slot_released(slot_started)
                     if is_success:
                         await limiter.release_success(was_probe, lane)
                     else:

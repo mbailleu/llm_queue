@@ -334,15 +334,29 @@ testable on its own.
 - `compute_cost()`: applies `model_pricing` (per 1M tokens).
 - `METRIC_WINDOWS`: the 1m/10m/1h/5h/24h dashboard windows.
 - `Metrics`: in-memory rolling window (default 24h) of completions; produces the
-  `overall` + `per_model` windowed summaries. `avg_duration()` exposes a cheap
-  O(1) EWMA latency that `AutoPacer` reads on every gate. `cost_of(model,
-  usage)` is the public per-request pricing hook the proxy handler uses to feed
-  cost budgets (None when the model has no pricing).
+  `overall` + `per_model` windowed summaries. `cost_of(model, usage)` is the
+  public per-request pricing hook the proxy handler uses to feed cost budgets
+  (None when the model has no pricing).
+- **Two clocks per request** — `request_finished(..., upstream_seconds)` splits
+  every duration into the **upstream** half (time a concurrency slot was held,
+  measured by the handler) and the **wait** half (`duration - upstream`: pacer
+  parking, queueing, 429 backoff). Both feed EWMAs: `avg_duration()` (total,
+  client-visible) and **`avg_upstream_time()` — the one `AutoPacer` must use**
+  for its `concurrency / service_time` cap. Using the total there creates a
+  feedback loop (pacing delay → longer measured duration → lower cap → more
+  delay) that one 429 backoff is enough to start. `upstream_seconds=None` means
+  "not measured" and counts the whole duration as upstream, so the split
+  degrades to the old single number instead of reporting a fake zero wait.
+  Summaries expose `avg/p50/p95_seconds` (total, unchanged) plus
+  `avg/p50/p95_upstream_seconds` and `avg/p95_wait_seconds`.
 
 ### `persistence.py` — stats.json + window.json
 - `PersistentStats`: folds completions into **hourly per-model buckets** +
   lifetime totals, flushes to `stats.json` on an interval.
-  - `record()`: called from `Metrics.request_finished`.
+  - `record()`: called from `Metrics.request_finished`; `upstream_sum` tracks
+    the slot-hold half of `duration_sum` (see `metrics.py`). `_avg_split()`
+    returns None/None for buckets written before that counter existed, so old
+    history reads as "unknown", never as "0s upstream, all wait".
   - `summary()`: 24h / 7d / 30d / lifetime totals.
   - `lifetime_tokens()`: cumulative per-model token counters by class
     (model_pricing key names) — the proxy-side half of a calibration snapshot.
@@ -379,6 +393,13 @@ testable on its own.
        window and run once quota resets. The backoff sleep is bracketed by
        `limiter.enter_rl_wait()` / `leave_rl_wait()` so the parked request shows
        up on the dashboard ("Waiting on 429" / statusline `⏳429×N`).
+  3b. **Slot-hold timing.** `slot_started = time.monotonic()` right after
+     `acquire()` returns, and `note_slot_released()` at *every* release site
+     (connection error, 429, and the `body_stream` finally) accumulates
+     `upstream_seconds` across attempts. `metrics.request_finished` gets it as
+     the service-time half. Keep a `note_slot_released` call paired with every
+     `release_*`: a missed one silently under-reports service time, which
+     inflates the pacer's throughput cap.
   4. On success, hand back a `StreamingResponse` whose `body_stream()` tees bytes
      through the usage extractor, then `release_*(was_probe, lane)` and finalizes
      metrics in its `finally`. `finalize` on a success also sums the four usage
@@ -406,6 +427,12 @@ All endpoints read the `AppState` via `request.app.state.proxy`.
   **one-shot** scheduled LOW→HIGH / HIGH→LOW switch (the recurring **daily** ones
   are the `scheduled_high_at` / `scheduled_low_at` config keys; all four slots are
   independent). The two share `_set_oneshot_switch()`.
+- `POST /_proxy/pacer/release` — `pacer.release_all()`: one free pass per
+  request currently parked in the gate (the rate itself is untouched).
+  `POST /_proxy/pacer/enabled` (`{"enabled": bool}`, omit to toggle) — the
+  throttle switch; goes through `apply_config_change` on
+  `auto_pacing_enabled`, so it behaves exactly like editing the config (and a
+  later file edit overrides it).
 - `POST /_proxy/calibrate/snapshot` (the provider's three cumulative cost
   counters) / `GET /_proxy/calibrate/prices` / `POST /_proxy/calibrate/reset`
   — per-model price calibration (see `calibrate.py`).
@@ -436,6 +463,13 @@ lacks `windows`.
   be highlighted (it's labelled `not paced` instead, from `pacer.windows[i].paces`).
   Only with no pacer window data at all (pacing off) does it fall back to the
   limiter snapshot's utilization mirror.
+- The header carries the pacer controls: **⏭ Release all** (shows the parked
+  count, disabled at 0) and the **🐢 Throttled / 🐇 Unthrottled** switch, which
+  renders the pacer's *state* (`.on` / `.off` classes) rather than the action.
+- Latency tables and throughput cards show `Upstream` / `Wait` next to the
+  total (`avg_upstream_seconds` / `avg_wait_seconds`); a wait larger than the
+  upstream half is highlighted, since that means the proxy — not the API — is
+  what the caller is waiting on.
 - **Hover-to-explain**: cards carrying a server-built derivation get
   `class="has-why"` + a `title` attribute (`pacer.explain`,
   `pacer.windows[i].explain`, and the adaptive-concurrency text on In Flight).

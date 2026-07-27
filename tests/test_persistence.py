@@ -104,3 +104,31 @@ def test_load_window_file_bad_content(tmp_path):
     assert load_window_file(path) is None          # not a dict
     path.write_text("{broken")
     assert load_window_file(path) is None          # invalid json
+
+
+def test_upstream_split_persists_and_survives_reload(tmp_path):
+    path = tmp_path / "stats.json"
+    ps = PersistentStats(path=str(path))
+    ps.record("m", 200, 10.0, None, upstream=2.0)   # 8s of the 10 was waiting
+    ps.record("m", 200, 10.0, None, upstream=4.0)
+    asyncio.run(ps.maybe_flush(force=True))
+    o = PersistentStats(path=str(path)).summary()["lifetime"]["overall"]
+    assert o["avg_seconds"] == 10.0
+    assert o["avg_upstream_seconds"] == 3.0
+    assert o["avg_wait_seconds"] == 7.0
+
+
+def test_legacy_buckets_report_unknown_split(tmp_path):
+    # A stats.json written before upstream_sum existed must not read back as
+    # "0s upstream, everything was wait".
+    path = tmp_path / "stats.json"
+    hour = int(time.time() // 3600) * 3600
+    legacy = {"count": 2, "success": 2, "errors": 0, "input_tokens": 0,
+              "output_tokens": 0, "cache_creation_input_tokens": 0,
+              "cache_read_input_tokens": 0, "duration_sum": 8.0}
+    path.write_text(json.dumps({"version": 1, "started_at": time.time(),
+                                "lifetime": {"m": legacy},
+                                "hours": {str(hour): {"m": legacy}}}))
+    o = PersistentStats(path=str(path)).summary()["lifetime"]["overall"]
+    assert o["avg_seconds"] == 4.0
+    assert o["avg_upstream_seconds"] is None and o["avg_wait_seconds"] is None
