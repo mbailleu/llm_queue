@@ -128,7 +128,8 @@ class Limiter:
     def __init__(self, low: Tier, high: Tier, initial_tier: str,
                  promotion_cooldown: float, forced: str | None,
                  window_weights: dict[str, float] | None = None,
-                 default_window_weight: float = 1.0):
+                 default_window_weight: float = 1.0,
+                 probe_enabled: bool = True):
         self._cond = asyncio.Condition()
         self._low = low
         self._high = high
@@ -137,6 +138,10 @@ class Limiter:
         if self._forced:
             self._active = self._low if self._forced == "low" else self._high
         self._promotion_cooldown = promotion_cooldown
+        # Speculative HIGH probing (config `probe_high_enabled`). With it off,
+        # a saturated LOW tier just queues: LOW->HIGH then happens only on a
+        # scheduled switch or an explicit user action (force_tier / boost).
+        self._probe_enabled = bool(probe_enabled)
         self._last_demotion = 0.0
         # Optional scheduled automatic tier switches. Each direction (LOW->HIGH
         # and HIGH->LOW) has two independent slots:
@@ -896,7 +901,8 @@ class Limiter:
         Human callers take priority: an auto request is never admitted while a
         human is waiting for a slot, and auto in-flight is capped at
         `max_concurrent - auto_concurrency_reserve` so a reserve (if configured)
-        is always free for humans. Only human requests trigger HIGH-tier probes.
+        is always free for humans. Only human requests trigger HIGH-tier probes,
+        and only while probing is enabled (`probe_high_enabled`).
         Returns True if this call was admitted as a speculative probe.
         """
         is_auto = lane == "auto"
@@ -932,7 +938,8 @@ class Limiter:
                         return False
 
                     can_probe = (
-                        self._forced is None
+                        self._probe_enabled
+                        and self._forced is None
                         and self._active is self._low
                         and not self._probe_in_flight
                         and self._waiters > 0
@@ -1413,12 +1420,15 @@ class Limiter:
     async def update_tiers(self, low: Tier, high: Tier,
                            promotion_cooldown: float, forced: str | None,
                            window_weights: dict[str, float] | None = None,
-                           default_window_weight: float | None = None) -> None:
+                           default_window_weight: float | None = None,
+                           probe_enabled: bool | None = None) -> None:
         async with self._cond:
             old_active_name = self._active.name
             self._low = low
             self._high = high
             self._promotion_cooldown = promotion_cooldown
+            if probe_enabled is not None:
+                self._probe_enabled = bool(probe_enabled)
             self._forced = forced if forced in ("low", "high") else None
             if window_weights is not None:
                 self._window_weights = dict(window_weights)
@@ -1468,6 +1478,7 @@ class Limiter:
             "rate_limited_waiting": self._rl_waiting,
             "last_rate_limited_at": self._last_rate_limited_at,
             "probe_in_flight": self._probe_in_flight,
+            "probe_enabled": self._probe_enabled,
             "schedule": self.schedule_snapshot(),
             "lanes": {
                 "human": {"in_flight": self._human_in_flight, "queued": self._human_waiters,

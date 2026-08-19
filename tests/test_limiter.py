@@ -435,6 +435,40 @@ def test_probe_promotes_on_success_and_demotes_on_rate_limit():
     asyncio.run(run())
 
 
+def test_probe_disabled_keeps_low_saturated():
+    async def run():
+        lim = make_limiter(promotion_cooldown=0.0, probe_enabled=False)
+        await lim.acquire("human")
+        await lim.acquire("human")                 # LOW saturated (max 2)
+        third = asyncio.create_task(lim.acquire("human"))
+        await asyncio.sleep(0.01)
+        assert not third.done()                    # queues instead of probing
+        assert lim.active.name == "low"
+        assert lim.snapshot()["probe_enabled"] is False
+        assert lim.snapshot()["totals"]["probes_sent"] == 0
+        # The user-driven paths still reach HIGH.
+        assert await lim.boost_high()
+        assert lim.active.name == "high"
+        assert await third is False                # admitted, but not as a probe
+        for _ in range(3):
+            await lim.release_success(False, "human")
+    asyncio.run(run())
+
+
+def test_update_tiers_toggles_probing():
+    async def run():
+        lim = make_limiter(promotion_cooldown=0.0)
+        await lim.update_tiers(lim._low, lim._high, 0.0, None, probe_enabled=False)
+        await lim.acquire("human")
+        await lim.acquire("human")
+        assert lim.snapshot()["probe_enabled"] is False
+        await lim.update_tiers(lim._low, lim._high, 0.0, None, probe_enabled=True)
+        assert await lim.acquire("human")          # probing back on
+        for _ in range(3):
+            await lim.release_success(False, "human")
+    asyncio.run(run())
+
+
 def test_boost_high_refused_when_forced():
     async def run():
         lim = make_limiter(forced="low")

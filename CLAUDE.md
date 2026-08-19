@@ -118,7 +118,11 @@ testable on its own.
     **probes HIGH** when LOW is saturated and the promotion cooldown has elapsed.
     Returns `was_probe`. **Human priority**: auto is never admitted while a human
     waits, and auto in-flight is capped at `max_concurrent - auto_concurrency_reserve`;
-    only humans probe.
+    only humans probe. Probing is gated by `_probe_enabled` (config
+    `probe_high_enabled`, hot-reloaded through `update_tiers(probe_enabled=…)`,
+    also flipped by `POST /_proxy/probe_enabled`): with it off a saturated LOW
+    just queues, so LOW→HIGH happens only via a scheduled switch or an explicit
+    user action (`force_tier` / `boost_high`). Demotion is unaffected.
   - `release_success` / `release_rate_limited` / `release_other_error` (each
     takes `lane`): release a slot via `_release_slot()` and drive **auto-tier
     switching** — a successful probe promotes LOW→HIGH; a rate-limit on HIGH
@@ -445,6 +449,9 @@ All endpoints read the `AppState` via `request.app.state.proxy`.
   **one-shot** scheduled LOW→HIGH / HIGH→LOW switch (the recurring **daily** ones
   are the `scheduled_high_at` / `scheduled_low_at` config keys; all four slots are
   independent). The two share `_set_oneshot_switch()`.
+  `POST /_proxy/probe_enabled` (`{"enabled": bool}`, omit to toggle) — speculative
+  LOW→HIGH probing on/off; like the pacer switch it goes through
+  `apply_config_change` on `probe_high_enabled`, so a later file edit overrides it.
 - `POST /_proxy/pacer/release` — `pacer.release_all()`: one free pass per
   request currently parked in the gate (the rate itself is untouched).
   `POST /_proxy/pacer/enabled` (`{"enabled": bool}`, omit to toggle) — the

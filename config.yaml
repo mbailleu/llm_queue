@@ -211,8 +211,18 @@ high_adaptive_increase_after: 20      # saturated successes needed per increase
 high_adaptive_cooldown_seconds: 15.0  # quiet period after a decrease (also blocks growth)
 high_adaptive_demote_at_min: true     # false = stay HIGH forever, just at min_concurrent
 
+# Speculative LOW->HIGH probing. While on LOW, once the concurrency cap is
+# saturated the proxy lets ONE waiting human request through as a probe; if it
+# comes back without a rate-limit the tier promotes to HIGH.
+# Set to false to turn that off entirely: LOW stays LOW no matter how busy it
+# gets, and the only ways to reach HIGH are the scheduled switches
+# (scheduled_high_at / POST /_proxy/schedule_high) or an explicit user action
+# (force_tier: "high" / POST /_proxy/boost). The HIGH->LOW demotion on a
+# rate-limit is unaffected.
+probe_high_enabled: true
+
 # After a HIGH->LOW demotion (or a failed probe), wait this many seconds before
-# trying to probe HIGH again.
+# trying to probe HIGH again. Ignored when probe_high_enabled is false.
 promotion_cooldown_seconds: 300
 
 # Retry behavior when upstream returns 429/503/529 or connection errors.

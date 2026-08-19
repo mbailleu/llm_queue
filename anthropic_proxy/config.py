@@ -152,6 +152,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # rate-limits, fall back to the old HIGH->LOW demotion: pushback at
     # LOW-level parallelism means the tier itself is wrong, not the concurrency.
     "high_adaptive_demote_at_min": True,
+    # Speculative LOW->HIGH probing. When LOW is saturated, one waiting human
+    # request is let through as a probe; if it succeeds the tier promotes.
+    # false = never probe: LOW->HIGH then only happens on a scheduled switch
+    # (scheduled_high_at / POST /_proxy/schedule_high) or an explicit user
+    # action (force_tier / POST /_proxy/boost).
+    "probe_high_enabled": True,
     "promotion_cooldown_seconds": 300,
     "retry_max_attempts": 12,
     "retry_base_delay": 1.0,
@@ -433,6 +439,7 @@ def build_state(config_path: Path | None = None) -> AppState:
         forced=forced,
         window_weights=window_weights,
         default_window_weight=default_window_weight,
+        probe_enabled=bool(cfg.get("probe_high_enabled", True)),
     )
     limiter.set_auto_params(
         concurrency_reserve=int(cfg.get("auto_concurrency_reserve", 0)),
@@ -498,6 +505,7 @@ async def apply_config_change(state: AppState, new_cfg: dict[str, Any]) -> None:
         forced=forced,
         window_weights=window_weights,
         default_window_weight=default_window_weight,
+        probe_enabled=bool(new_cfg.get("probe_high_enabled", True)),
     )
     state.limiter.set_auto_params(
         concurrency_reserve=int(new_cfg.get("auto_concurrency_reserve", 0)),

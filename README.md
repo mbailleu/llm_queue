@@ -393,6 +393,13 @@ pile of waiting requests won't block fresh ones.
 - A `429 / 503 / 529` while in HIGH → shrink the concurrency estimate (below);
   only once that has bottomed out does the proxy demote back to LOW.
 
+Set `probe_high_enabled: false` (or `POST /_proxy/probe_enabled`) to switch
+probing off entirely. LOW then stays LOW however busy it gets, and the only
+routes to HIGH are the scheduled switches (`scheduled_high_at` /
+`POST /_proxy/schedule_high`) and explicit user action (`force_tier: "high"`,
+`POST /_proxy/boost`, the dashboard's **⚡ Boost HIGH** button). Demotion on a
+rate-limit is unaffected.
+
 ### Adaptive HIGH concurrency
 
 `tiers.high.max_concurrent` is an *upper bound*, not a target. With a
@@ -448,6 +455,7 @@ or set `force_tier: high` in `config.yaml` (picked up within ~2s).
 | `/_proxy/statusline`     | GET  | One-line text status |
 | `/_proxy/force_tier`     | POST | Pin a tier: `{"tier": "low" \| "high" \| null}` |
 | `/_proxy/boost`          | POST | Jump to HIGH temporarily; auto-demotes on the next rate-limit |
+| `/_proxy/probe_enabled`  | POST | Speculative LOW→HIGH probing: `{"enabled": true \| false}`, or no body to toggle |
 | `/_proxy/pacer/release`  | POST | Let everything the pacer is holding through, once (no body) |
 | `/_proxy/pacer/enabled`  | POST | Throttle switch: `{"enabled": true \| false}`, or no body to toggle |
 | `/_proxy/window/count`   | POST | Set the active quota window's count: `{"count": N}` |
@@ -686,6 +694,7 @@ and `listen_port` — those require a restart.
 | `high_adaptive_increase_after` | `20` | Saturated successes needed per increase. |
 | `high_adaptive_cooldown_seconds` | `15.0` | Quiet period after a decrease (blocks further decreases *and* growth). |
 | `high_adaptive_demote_at_min` | `true` | At the floor, a further `429` demotes HIGH→LOW; `false` = never demote. |
+| `probe_high_enabled` | `true` | Speculative LOW→HIGH probing. `false` = reach HIGH only via a scheduled switch or an explicit user action. |
 | `promotion_cooldown_seconds` | `300` | Min seconds between failed probe / demotion and next probe. |
 | `retry_max_attempts` | `12` | Max **connection-error** retries per request. |
 | `retry_base_delay` / `retry_max_delay` | `1.0` / `60.0` | Exponential backoff bounds. |

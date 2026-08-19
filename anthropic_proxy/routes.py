@@ -254,6 +254,35 @@ async def boost_endpoint(req: Request):
     return st.limiter.snapshot()
 
 
+@router.post("/_proxy/probe_enabled")
+async def probe_enabled_endpoint(req: Request):
+    """Turn speculative LOW->HIGH probing on or off.
+
+    Body: {"enabled": true|false}, or omit it to toggle. Off means a saturated
+    LOW tier just queues instead of sending a probe, so LOW->HIGH only happens
+    on a scheduled switch or an explicit user action (force_tier / boost). Goes
+    through the live config, so it is exactly equivalent to editing
+    `probe_high_enabled` in config.yaml — and a later edit of that file wins.
+      curl -X POST localhost:8787/_proxy/probe_enabled -d '{"enabled": false}'
+    """
+    st = _st(req)
+    try:
+        body = await req.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    if "enabled" in body:
+        enabled = body["enabled"]
+        if not isinstance(enabled, bool):
+            return JSONResponse({"error": "'enabled' must be true or false"},
+                                status_code=400)
+    else:
+        enabled = not bool(st.config.get("probe_high_enabled", True))
+    await apply_config_change(st, {**st.config, "probe_high_enabled": enabled})
+    return {"enabled": enabled, "limiter": st.limiter.snapshot()}
+
+
 @router.post("/_proxy/pacer/release")
 async def pacer_release_endpoint(req: Request):
     """Release every automation request currently parked by the pacer, once.

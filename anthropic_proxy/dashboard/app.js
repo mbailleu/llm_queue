@@ -433,7 +433,7 @@ async function tick() {
       <div class="stat">
         <div class="label">Active Tier</div>
         <div class="value ${tierClass}">${L.active_tier.toUpperCase()}</div>
-        <div class="sub">${L.forced_tier ? "forced" : "auto"}${L.probe_in_flight ? " · probing" : ""}</div>
+        <div class="sub">${L.forced_tier ? "forced" : (L.probe_enabled === false ? "auto · no probe" : "auto")}${L.probe_in_flight ? " · probing" : ""}</div>
         ${schedSubs.map((s) => `<div class="sub">${s}</div>`).join("")}
       </div>
       <div class="stat"${adaptTitle ? ` title="${adaptTitle}"` : ""}>
